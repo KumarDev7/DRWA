@@ -43,7 +43,7 @@ train:
   seed: 42
   log_every: 10
   checkpoint_every: 5000
-  keep: 3
+  keep_checkpoints: 3
 
 data:
   source: tiny_stories
