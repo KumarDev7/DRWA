@@ -1,0 +1,63 @@
+# Dense config for Google Colab TPU v5e-1 (16GB HBM)
+# ~130M params, fits comfortably in bf16 with batch_size=8, seq_len=1024
+#
+# Memory (bf16 + Adam):
+#   Params+optimizer:   ~1.6 GB
+#   Activations (remat): ~4-6 GB
+#   Total:              ~6-8 GB
+#   Headroom:           ~8-10 GB
+
+model:
+  vocab_size: 50257
+  seq_len: 1024
+  d_model: 768
+  d_ffn: 3072
+  d_A: 768
+  d_B: 768
+  N: 1
+  k_max: 1
+  r: 64
+  S: 4
+  d_k: 256
+  num_loops: 3
+  halt_threshold: 0.99
+  lambda_gate: 3.0
+  gamma_init: 0.05
+  use_rope: true
+  n_layers_A: 4
+  n_layers_B: 4
+  n_heads: 12
+  n_kv_heads: 6
+  bf16_pool: true
+  compute_dtype: bfloat16
+  remat: true
+
+train:
+  total_steps: 50000
+  steps_per_window: 32
+  batch_size: 8
+  lr_pool: 3.0e-4
+  lr_transformer: 1.0e-3
+  warmup_steps: 1000
+  grad_clip_norm: 1.0
+  seed: 42
+  log_every: 10
+  checkpoint_every: 5000
+  keep_checkpoints: 3
+
+sharding:
+  n_data: 1
+  n_model: 1
+
+data:
+  source: tiny_stories
+  hf_tokenizer: gpt2
+
+checkpoint:
+  dir: checkpoints/dense_colab
+  every: 5000
+  keep: 3
+
+wandb:
+  project: drwa
+  name: dense_colab_340m

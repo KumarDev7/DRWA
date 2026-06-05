@@ -1,0 +1,47 @@
+# Dense small config for testing
+model:
+  vocab_size: 50257
+  seq_len: 512
+  d_model: 256
+  d_ffn: 1024
+  N: 1
+  k_max: 1
+  r: 64
+  S: 4
+  d_k: 256
+  d_A: 256
+  d_B: 256
+  num_loops: 3
+  halt_threshold: 0.99
+  lambda_gate: 3.0
+  gamma_init: 0.05
+  use_rope: true
+  n_layers_A: 2
+  n_layers_B: 2
+  n_heads: 4
+  n_kv_heads: 4
+
+train:
+  total_steps: 5000
+  steps_per_window: 32
+  batch_size: 32
+  lr_pool: 3.0e-5
+  lr_transformer: 1.0e-4
+  warmup_steps: 500
+  steps_per_window: 32
+
+sharding:
+  n_data: 1
+  n_model: 1
+
+data:
+  source: random
+
+checkpoint:
+  dir: checkpoints/dense_small
+  every: 1000
+  keep: 3
+
+wandb:
+  project: drwa
+  name: dense_small_test

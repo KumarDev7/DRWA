@@ -1,0 +1,54 @@
+# Tiny CPU training config — trains in ~5-10 min on CPU
+# Micro model: ~480K params, seq_len=128, batch=4
+# Uses TinyStories for real text data
+
+model:
+  vocab_size: 50257
+  seq_len: 128
+  d_model: 64
+  d_ffn: 256
+  d_A: 64
+  d_B: 64
+  N: 1
+  k_max: 1
+  r: 16
+  S: 2
+  d_k: 32
+  num_loops: 1
+  halt_threshold: 0.99
+  lambda_gate: 3.0
+  gamma_init: 0.05
+  use_rope: true
+  n_layers_A: 2
+  n_layers_B: 2
+  n_heads: 4
+  n_kv_heads: 4
+
+train:
+  total_steps: 500
+  steps_per_window: 1      # No scan on CPU — step-by-step
+  batch_size: 4
+  lr_pool: 3.0e-4
+  lr_transformer: 1.0e-3
+  warmup_steps: 50
+  grad_clip_norm: 1.0
+  seed: 42
+  log_every: 10
+  checkpoint_every: 1000   # Don't checkpoint during short test
+
+sharding:
+  n_data: 1
+  n_model: 1
+
+data:
+  source: tiny_stories
+  hf_tokenizer: gpt2
+
+checkpoint:
+  dir: checkpoints/cpu_tiny
+  every: 1000
+  keep: 1
+
+wandb:
+  project: drwa
+  name: cpu_tiny_test

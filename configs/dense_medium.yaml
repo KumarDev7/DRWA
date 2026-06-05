@@ -1,0 +1,48 @@
+# Medium dense config (125M params, like GPT-2 small)
+model:
+  vocab_size: 50257
+  seq_len: 1024
+  d_model: 768
+  d_ffn: 3072
+  N: 1
+  k_max: 1
+  r: 64
+  S: 4
+  d_k: 256
+  d_A: 768
+  d_B: 768
+  num_loops: 3
+  halt_threshold: 0.99
+  lambda_gate: 3.0
+  gamma_init: 0.05
+  use_rope: true
+  n_layers_A: 6
+  n_layers_B: 6
+  n_heads: 12
+  n_kv_heads: 12
+
+train:
+  total_steps: 100000
+  steps_per_window: 32
+  batch_size: 128
+  lr_pool: 3.0e-5
+  lr_transformer: 1.0e-4
+  warmup_steps: 1000
+  grad_clip_norm: 1.0
+
+sharding:
+  n_data: 8
+  n_model: 1
+
+data:
+  source: tiny_stories
+  hf_tokenizer: gpt2
+
+checkpoint:
+  dir: checkpoints/dense_medium
+  every: 5000
+  keep: 3
+
+wandb:
+  project: drwa
+  name: dense_medium_125m
