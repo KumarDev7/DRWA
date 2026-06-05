@@ -156,20 +156,20 @@ def compute_step_flops(config: DRWAConfig, batch_size: int) -> int:
     head_dim = d // n_heads
     n_layers = config.n_layers_A + config.n_layers_B
 
-    attn_flops_per_layer = B * T * (
-        4 * d * d
-        + 2 * T * head_dim * n_heads
-    )
+    d_kv = n_kv_heads * head_dim
+    d_q = n_heads * head_dim
+    attn_proj_flops = 2 * B * T * (d * d_q + d * d_kv + d * d_kv + d * d_q)
+    attn_score_flops = 2 * B * T * T * n_heads * head_dim
+    attn_output_flops = attn_score_flops
+    attn_flops_per_layer = attn_proj_flops + attn_score_flops + attn_output_flops
 
-    ffn_flops_per_layer = B * T * (
-        2 * d * d_ffn
-    )
+    ffn_flops_per_layer = 2 * B * T * (d * d_ffn + d_ffn * d)
 
-    assembly_flops = B * T * (2 * config.d_A * config.d_B * config.r)
+    assembly_flops = 2 * B * T * (config.d_A * config.d_B + config.d_A * config.r + config.r * config.d_B)
 
     embed_flops = B * T * d
 
-    lm_head_flops = B * T * d * V
+    lm_head_flops = 2 * B * T * d * V
 
     forward_flops = (
         n_layers * (attn_flops_per_layer + ffn_flops_per_layer)
