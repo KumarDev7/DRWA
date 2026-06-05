@@ -1,5 +1,5 @@
 # Dense config for Google Colab TPU v5e-1 (16GB HBM)
-# ~130M params, fits comfortably in bf16 with batch_size=8, seq_len=1024
+# ~130M params, bf16, remat, single-step (no scan)
 #
 # Memory (bf16 + Adam):
 #   Params+optimizer:   ~1.6 GB
@@ -43,8 +43,17 @@ train:
   seed: 42
   log_every: 10
   checkpoint_every: 5000
-  keep_checkpoints: 3
+  keep: 3
+
+data:
+  source: tiny_stories
+  hf_tokenizer: gpt2
+
+checkpoint:
+  dir: checkpoints/dense_colab
+  every: 5000
+  keep: 3
 
 wandb:
   project: drwa
-  name: dense_colab_340m
+  name: dense_colab_130m

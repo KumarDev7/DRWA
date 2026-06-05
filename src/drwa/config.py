@@ -203,8 +203,8 @@ class TrainConfig:
     
     # Training schedule
     total_steps: int = 100_000
-    steps_per_window: int = 32  # Steps per JIT compilation window
-    batch_size: int = 128
+    steps_per_window: int = 1  # Steps per JIT compilation (1=single-step, 32+=windowed)
+    batch_size: int = 4
     
     # Learning rate
     lr_pool: float = 3e-5
