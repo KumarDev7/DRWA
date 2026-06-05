@@ -34,8 +34,8 @@ model:
 
 train:
   total_steps: 50000
-  steps_per_window: 32
-  batch_size: 8
+  steps_per_window: 1
+  batch_size: 4
   lr_pool: 3.0e-4
   lr_transformer: 1.0e-3
   warmup_steps: 1000
@@ -44,19 +44,6 @@ train:
   log_every: 10
   checkpoint_every: 5000
   keep_checkpoints: 3
-
-sharding:
-  n_data: 1
-  n_model: 1
-
-data:
-  source: tiny_stories
-  hf_tokenizer: gpt2
-
-checkpoint:
-  dir: checkpoints/dense_colab
-  every: 5000
-  keep: 3
 
 wandb:
   project: drwa
