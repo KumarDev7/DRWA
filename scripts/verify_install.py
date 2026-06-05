@@ -106,7 +106,7 @@ def test_flops_calculation():
     from drwa.config import TrainConfig
     train_config = TrainConfig(batch_size=32)
     
-    flops = compute_step_flops(config, train_config)
+    flops = compute_step_flops(config, train_config.batch_size)
     print(f"✓ FLOPs per step: {flops / 1e9:.2f}G")
     
     return True

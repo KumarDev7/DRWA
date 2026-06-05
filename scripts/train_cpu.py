@@ -111,7 +111,7 @@ def main():
     warmup_batch = jnp.array(loader.get_window(1)[0])
     t0 = time.time()
     _ = train_step(model, optimizer, warmup_batch)
-    jax.block_until_ready(1)
+    jax.block_until_ready(_)
     print(f"Compilation took {time.time()-t0:.1f}s")
 
     total_steps = 200

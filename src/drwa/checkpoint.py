@@ -46,37 +46,31 @@ class CheckpointManager:
         model_state = nnx.state(model, nnx.Param)
         opt_state = optimizer.opt_state
         
-        # Convert to numpy for saving
-        model_np = jax.tree_util.tree_map(np.array, model_state)
-        opt_np = jax.tree_util.tree_map(
-            lambda x: np.array(x) if hasattr(x, 'shape') else x,
-            opt_state
-        )
-        
         # Create checkpoint path
         checkpoint_path = self.checkpoint_dir / f"step_{step}"
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         
         # Save model
         model_path = checkpoint_path / "model"
-        self.checkpointer.save(model_path, ocp.args.PyTreeSave(model_np))
+        self.checkpointer.save(model_path, ocp.args.PyTreeSave(model_state))
         
         # Save optimizer
         opt_path = checkpoint_path / "optimizer"
-        self._save_optimizer_state(opt_path, opt_np)
+        self.checkpointer.save(opt_path, ocp.args.PyTreeSave(opt_state))
         
         # Save metadata
-        metadata = {
-            "step": step,
-            "timestamp": datetime.now().isoformat(),
-            "metrics": metrics or {},
-        }
-        np.save(checkpoint_path / "metadata.npy", metadata, allow_pickle=True)
-        
-        # Cleanup old checkpoints
-        self._cleanup_old_checkpoints()
-        
-        print(f"✓ Checkpoint saved: {checkpoint_path}")
+        if jax.process_index() == 0:
+            metadata = {
+                "step": step,
+                "timestamp": datetime.now().isoformat(),
+                "metrics": metrics or {},
+            }
+            np.save(checkpoint_path / "metadata.npy", metadata, allow_pickle=True)
+            
+            # Cleanup old checkpoints
+            self._cleanup_old_checkpoints()
+            
+            print(f"✓ Checkpoint saved: {checkpoint_path}")
     
     def load(
         self,
@@ -108,16 +102,12 @@ class CheckpointManager:
         model_state = self.checkpointer.restore(model_path)
         
         # Apply to model
-        model_state_pytree = jax.tree_util.tree_map(
-            lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x,
-            model_state
-        )
-        nnx.update(model, model_state_pytree)
+        nnx.update(model, model_state)
         
         # Load optimizer if provided
         if optimizer is not None:
             opt_path = checkpoint_path / "optimizer"
-            opt_state = self._load_optimizer_state(opt_path)
+            opt_state = self.checkpointer.restore(opt_path)
             optimizer.opt_state = opt_state
         
         # Load metadata
@@ -144,20 +134,6 @@ class CheckpointManager:
             old_ckpt = checkpoints.pop(0)
             import shutil
             shutil.rmtree(old_ckpt)
-    
-    def _save_optimizer_state(self, path: Path, state):
-        """Save optimizer state."""
-        path.mkdir(parents=True, exist_ok=True)
-        # Save as pickled file for simplicity
-        import pickle
-        with open(path / "state.pkl", "wb") as f:
-            pickle.dump(state, f)
-    
-    def _load_optimizer_state(self, path: Path):
-        """Load optimizer state."""
-        import pickle
-        with open(path / "state.pkl", "rb") as f:
-            return pickle.load(f)
 
 
 class MetricsLogger:

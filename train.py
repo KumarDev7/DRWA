@@ -11,6 +11,8 @@ import jax.numpy as jnp
 from flax import nnx
 import optax
 import numpy as np
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental import mesh_utils
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
@@ -42,8 +44,11 @@ def train(config: RunConfig, resume_from: str = None):
     print("=" * 72)
 
     devices = jax.devices()
-    device = devices[0]
     n_devices = len(devices)
+    device = devices[0]
+    mesh = Mesh(mesh_utils.create_device_mesh((n_devices,)), axis_names=('data',))
+    data_sharding = NamedSharding(mesh, P('data', None))
+    window_sharding = NamedSharding(mesh, P(None, 'data', None))
     model_config = config.model
     train_config = config.train
 
@@ -105,6 +110,8 @@ def train(config: RunConfig, resume_from: str = None):
     loader = create_data_loader(
         {"model": model_config.__dict__, "data": config.data.__dict__},
         train_config,
+        process_index=jax.process_index(),
+        process_count=jax.process_count(),
     )
 
     total_steps = train_config.total_steps
@@ -117,40 +124,40 @@ def train(config: RunConfig, resume_from: str = None):
         def loss_fn(m):
             return forward_and_loss(m, batch, model_config, train_config, deterministic=False)
         (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+        grads = jax.tree_util.tree_map(lambda g: g / n_devices, grads)
         optimizer.update(model, grads)
         return loss, metrics
 
-    # Multi-step window (for steps_per_window > 1) — entire loop inside scan
     if steps_per_window > 1:
         @nnx.jit
         def train_window(model, optimizer, data):
-            # data: [steps_per_window, batch_size, seq_len]
-            # Entire training loop runs inside jax.lax.scan — no Python loop
-            def step_fn(carry, xs):
-                m, opt = carry
-                batch = xs
+            graphdef, state = nnx.split((model, optimizer))
+            def step_fn(carry_state, batch):
+                m, opt = nnx.merge(graphdef, carry_state)
                 def loss_fn(mdl):
                     return forward_and_loss(mdl, batch, model_config, train_config, deterministic=False)
                 (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(m)
+                grads = jax.tree_util.tree_map(lambda g: g / n_devices, grads)
                 opt.update(m, grads)
-                return (m, opt), loss
-            init_carry = (model, optimizer)
-            _, losses = jax.lax.scan(step_fn, init_carry, data)
-            return jnp.mean(losses)
+                _, new_state = nnx.split((m, opt))
+                return new_state, (loss, metrics)
+            final_state, (losses, metrics) = jax.lax.scan(step_fn, state, data)
+            nnx.update((model, optimizer), final_state)
+            return jnp.mean(losses), metrics
 
     print(f"\n  Compiling...")
     warmup_data = loader.get_window(steps_per_window if steps_per_window > 1 else 1)
     if steps_per_window > 1:
-        warmup_input = jnp.array(warmup_data)
+        warmup_input = jax.device_put(warmup_data, window_sharding)
     else:
-        warmup_input = jnp.array(warmup_data[0])
+        warmup_input = jax.device_put(warmup_data[0], data_sharding)
 
     t0 = time.time()
     if steps_per_window > 1:
         _ = train_window(model, optimizer, warmup_input)
     else:
         _ = train_step(model, optimizer, warmup_input)
-    jax.block_until_ready(1)
+    jax.block_until_ready(_)
     compile_time = time.time() - t0
     print(f"  Compiled in {compile_time:.1f}s")
 
@@ -170,10 +177,12 @@ def train(config: RunConfig, resume_from: str = None):
         for window_idx in range(n_windows):
             step = start_step + window_idx * steps_per_window
 
-            data = jnp.array(loader.get_window(steps_per_window))
+            data_np = loader.get_window(steps_per_window)
+            data = jax.device_put(data_np, window_sharding)
 
             win_t0 = time.time()
-            loss_val = float(jax.block_until_ready(train_window(model, optimizer, data)))
+            loss, window_metrics = train_window(model, optimizer, data)
+            loss_val = float(jax.block_until_ready(loss))
             win_time = time.time() - win_t0
 
             sps = steps_per_window / win_time if win_time > 0 else 0
@@ -212,7 +221,8 @@ def train(config: RunConfig, resume_from: str = None):
         final_step = start_step + n_windows * steps_per_window
     else:
         for step in range(start_step, total_steps):
-            batch = jnp.array(loader.get_window(1)[0])
+            batch_np = loader.get_window(1)[0]
+            batch = jax.device_put(batch_np, data_sharding)
 
             step_t0 = time.time()
             loss, metrics = train_step(model, optimizer, batch)

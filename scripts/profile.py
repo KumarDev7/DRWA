@@ -157,7 +157,7 @@ def compute_throughput(
     Returns:
         Dict with throughput metrics
     """
-    step_flops = compute_step_flops(config, train_config)
+    step_flops = compute_step_flops(config, train_config.batch_size)
     total_time = forward_time + backward_time
     
     steps_per_sec = 1.0 / total_time

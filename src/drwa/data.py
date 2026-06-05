@@ -113,13 +113,14 @@ class HuggingFaceDataLoader(DataLoader):
         
         # Text column
         self.text_column = hf_text_column
+        self.dataset_iter = iter(self.dataset)
     
     def _refill_buffer(self, needed: int):
         """Refill buffer with at least `needed` tokens."""
         while len(self.buffer) - self.buffer_pos < needed:
             try:
                 # Get next example
-                example = next(iter(self.dataset))
+                example = next(self.dataset_iter)
                 text = example[self.text_column]
                 
                 # Tokenize
@@ -148,8 +149,9 @@ class HuggingFaceDataLoader(DataLoader):
                     split=self.dataset.split,
                     streaming=True,
                 )
+                self.dataset_iter = iter(self.dataset)
     
-    def get_window(self, steps: int) -> jnp.ndarray:
+    def get_window(self, steps: int) -> np.ndarray:
         """Get a window of packed token sequences."""
         needed = steps * self.batch_size * self.seq_len
         self._refill_buffer(needed)
@@ -161,7 +163,7 @@ class HuggingFaceDataLoader(DataLoader):
         # Reshape
         window = window_flat.reshape(steps, self.batch_size, self.seq_len)
         
-        return jnp.array(window, dtype=jnp.int32)
+        return window.astype(np.int32)
     
     def reset(self):
         """Reset buffer."""

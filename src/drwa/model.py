@@ -7,6 +7,7 @@ Dense mode (N=1) for stable training, expandable to DRWA (N>1) after training.
 import jax
 import jax.numpy as jnp
 from flax import nnx
+import optax
 from typing import Tuple, Optional
 
 from .config import DRWAConfig, TrainConfig
@@ -42,13 +43,14 @@ class SimpleAssembly(nnx.Module):
         self.b = nnx.Param(jnp.zeros(d_B, dtype=dtype))
 
         self.norm = nnx.LayerNorm(d_B, dtype=dtype, rngs=rngs)
+        if d_A != d_B:
+            self.proj = nnx.Linear(d_A, d_B, use_bias=False, dtype=dtype, rngs=rngs)
 
     def __call__(self, h_A):
-        W = self.W_base.value + self.U.value @ self.V.value
-        b = self.b_base.value + self.b.value
-        h_res = h_A @ W.T + b[None, None, :]
-        h_mid = self.norm(h_A + self.gamma.value[0] * h_res)
-        return h_mid, {"W_delta_norm": jnp.linalg.norm(W - self.W_base.value).mean()}
+        h_proj = self.proj(h_A) if self.d_A != self.d_B else h_A
+        h_res = h_A @ self.W_base.value.T + (h_A @ self.V.value.T) @ self.U.value.T + (self.b_base.value + self.b.value)[None, None, :]
+        h_mid = self.norm(h_proj + self.gamma.value[0] * h_res)
+        return h_mid, {}
 
 
 class DRWAModel(nnx.Module):
@@ -56,7 +58,7 @@ class DRWAModel(nnx.Module):
         self.config = config
         compute_dtype = jnp.bfloat16 if config.compute_dtype == "bfloat16" else jnp.float32
 
-        self.embed = nnx.Embed(config.vocab_size, config.d_model, rngs=rngs)
+        self.embed = nnx.Embed(config.vocab_size, config.d_model, dtype=compute_dtype, rngs=rngs)
 
         self.part_a = PartA(
             d_model=config.d_A,
@@ -99,7 +101,6 @@ class DRWAModel(nnx.Module):
         B, T = input_ids.shape
 
         h = self.embed(input_ids)
-        h = h.astype(jnp.bfloat16) if self.config.compute_dtype == "bfloat16" else h
 
         h_A = self.part_a(h, deterministic=deterministic)
         h_mid, assembly_info = self.assembly(h_A)
@@ -134,8 +135,9 @@ def forward_and_loss(
     logits_flat = logits_shifted.reshape(-1, config.vocab_size)
     targets_flat = targets_shifted.reshape(-1)
 
-    log_probs = jax.nn.log_softmax(logits_flat.astype(jnp.float32), axis=-1)
-    loss = -jnp.mean(log_probs[jnp.arange(B * (T - 1)), targets_flat])
+    loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits_flat.astype(jnp.float32), targets_flat
+    ).mean()
 
     metrics["loss"] = loss
     metrics["perplexity"] = jnp.exp(loss)
@@ -180,4 +182,4 @@ def compute_step_flops(config: DRWAConfig, batch_size: int) -> int:
 
 
 def count_params(model: nnx.Module) -> int:
-    return sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(model)))
+    return sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(model, nnx.Param)))

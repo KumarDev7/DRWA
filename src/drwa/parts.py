@@ -14,12 +14,11 @@ def precompute_rope_freqs(dim: int, max_seq_len: int, base: float = 10000.0):
 
 def apply_rope(x, cos, sin):
     B, T, n_heads, head_dim = x.shape
-    x1 = x[..., :head_dim // 2]
-    x2 = x[..., head_dim // 2:]
     cos = cos[:T, :][None, :, None, :]
     sin = sin[:T, :][None, :, None, :]
-    rotated = jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
-    return rotated
+    half_dim = head_dim // 2
+    x_rotated = jnp.concatenate([-x[..., half_dim:], x[..., :half_dim]], axis=-1)
+    return x * cos + x_rotated * sin
 
 
 class CausalSelfAttention(nnx.Module):
@@ -36,8 +35,10 @@ class CausalSelfAttention(nnx.Module):
         self.wo = nnx.Linear(n_heads * self.head_dim, d_model, dtype=dtype, rngs=rngs)
         if use_rope:
             cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len)
-            self.cos = nnx.Variable(cos)
-            self.sin = nnx.Variable(sin)
+            cos_full = jnp.concatenate([cos, cos], axis=-1).astype(dtype)
+            sin_full = jnp.concatenate([sin, sin], axis=-1).astype(dtype)
+            self.cos = nnx.Variable(cos_full)
+            self.sin = nnx.Variable(sin_full)
 
     def __call__(self, x, mask=None, deterministic=True):
         B, T, d = x.shape
@@ -47,17 +48,11 @@ class CausalSelfAttention(nnx.Module):
         if self.use_rope:
             q = apply_rope(q, self.cos.value, self.sin.value)
             k = apply_rope(k, self.cos.value, self.sin.value)
-        if self.n_kv_heads < self.n_heads:
-            n_rep = self.n_heads // self.n_kv_heads
-            k = jnp.repeat(k, n_rep, axis=2)
-            v = jnp.repeat(v, n_rep, axis=2)
-        scale = self.head_dim ** -0.5
-        attn = jnp.einsum('bthd,bshd->bhts', q, k) * scale
-        if mask is None:
-            mask = jnp.triu(jnp.full((T, T), -1e9), k=1)
-        attn = attn + mask[None, None, :, :]
-        attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(self.dtype)
-        out = jnp.einsum('bhts,bshd->bthd', attn, v)
+        out = jax.nn.dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            mask=mask,
+        )
         out = out.reshape(B, T, self.n_heads * self.head_dim)
         return self.wo(out)
 
@@ -82,8 +77,12 @@ class TransformerBlock(nnx.Module):
 
     def __call__(self, x, mask=None, deterministic=True):
         if self._remat:
-            x = x + jax.checkpoint(lambda h: self.attn(self.norm1(h), mask, deterministic))(x)
-            x = x + jax.checkpoint(lambda h: self.ffn(self.norm2(h)))(x)
+            @nnx.remat
+            def remat_block(block, h_in, m_in):
+                h_out = h_in + block.attn(block.norm1(h_in), m_in, deterministic)
+                h_out = h_out + block.ffn(block.norm2(h_out))
+                return h_out
+            x = remat_block(self, x, mask)
         else:
             x = x + self.attn(self.norm1(x), mask, deterministic)
             x = x + self.ffn(self.norm2(x))

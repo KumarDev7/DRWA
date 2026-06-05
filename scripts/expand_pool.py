@@ -172,42 +172,32 @@ def expand_pool(
     
     print(f"Initializing {n_pool} pool vectors with rank {rank}...")
     
-    pool_vectors = []
-    pool_keys = []
+    W_deltas = W_full[None, :, :] + np.random.randn(n_pool, config.d_B, config.d_A) * 0.01
     
-    for i in tqdm(range(n_pool)):
-        mask = (cluster_ids == i)
-        cluster_size = mask.sum()
-        
-        if cluster_size < 10:
-            h_cluster = np.tile(centroids[i:i+1], (10, 1))
-            h_cluster += np.random.randn(10, config.d_A) * 0.01
-        else:
-            h_cluster = activations[mask]
-        
-        W_local = W_full + np.random.randn(config.d_B, config.d_A) * 0.01
-        W_delta = W_local
-        
-        U, S, Vh = np.linalg.svd(W_delta, full_matrices=False)
-        
-        U_r = U[:, :rank] @ np.diag(np.sqrt(S[:rank]))
-        V_r = np.diag(np.sqrt(S[:rank])) @ Vh[:rank, :]
-        b_r = np.random.randn(config.d_B) * 0.01
-        
-        pool_vec = np.concatenate([
-            U_r.flatten(),
-            V_r.flatten(),
-            b_r,
-        ])
-        
-        pool_vectors.append(pool_vec)
-        
-        key = centroids[i] @ np.random.randn(config.d_A, config.d_k).astype(np.float32)
-        key = key / (np.linalg.norm(key) + 1e-8)
-        pool_keys.append(key)
+    print("Computing SVD on CPU...")
+    U_list, S_list, Vh_list = [], [], []
+    for m in tqdm(W_deltas):
+        u, s, vh = np.linalg.svd(m, full_matrices=False)
+        U_list.append(u)
+        S_list.append(s)
+        Vh_list.append(vh)
+    U = np.stack(U_list)
+    S = np.stack(S_list)
+    Vh = np.stack(Vh_list)
     
-    pool_vectors = jnp.stack(pool_vectors, axis=0)
-    pool_keys = jnp.stack(pool_keys, axis=0)
+    S_sqrt = np.sqrt(S[:, :rank])
+    U_r = U[:, :, :rank] * S_sqrt[:, None, :]
+    V_r = S_sqrt[:, :, None] * Vh[:, :rank, :]
+    b_r = np.random.randn(n_pool, config.d_B) * 0.01
+    
+    U_r_flat = U_r.reshape(n_pool, -1)
+    V_r_flat = V_r.reshape(n_pool, -1)
+    pool_vectors = jnp.array(np.concatenate([U_r_flat, V_r_flat, b_r], axis=-1))
+    
+    proj = np.random.randn(n_pool, config.d_A, config.d_k).astype(np.float32)
+    pool_keys = np.einsum('ni,nij->nj', centroids, proj)
+    pool_keys = pool_keys / (np.linalg.norm(pool_keys, axis=-1, keepdims=True) + 1e-8)
+    pool_keys = jnp.array(pool_keys)
     
     print(f"✓ Pool vectors: {pool_vectors.shape}")
     print(f"✓ Pool keys: {pool_keys.shape}")
