@@ -22,10 +22,11 @@ from drwa.checkpoint import CheckpointManager, MetricsLogger
 
 
 def create_optimizer(model, config: TrainConfig):
-    schedule = optax.cosine_decay_schedule(
-        init_value=config.lr_transformer,
-        decay_steps=config.total_steps,
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=config.lr_transformer,
         warmup_steps=config.warmup_steps,
+        decay_steps=config.total_steps,
         end_value=config.lr_transformer * config.lr_min_scale,
     )
     tx = optax.chain(
@@ -58,13 +59,13 @@ def train(config: RunConfig, resume_from: str = None):
     tokens_per_step = train_config.batch_size * model_config.seq_len
 
     peak_tflops_map = {
-        "v5e": 197.0, "v5lite": 197.0, "v5p": 459.0,
+        "v5e": 197.0, "v5lite": 197.0, "v5 lite": 197.0, "v5p": 459.0,
         "a100": 312.0, "h100": 990.0, "cpu": 0.0,
     }
-    device_kind_lower = str(device.device_kind).lower()
+    device_kind_lower = str(device.device_kind).lower().replace("(", "").replace(")", "")
     peak_tflops = 0.0
     for key, val in peak_tflops_map.items():
-        if key in device_kind_lower:
+        if key.lower() in device_kind_lower:
             peak_tflops = val * n_devices
             break
 
