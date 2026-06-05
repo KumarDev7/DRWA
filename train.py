@@ -46,11 +46,28 @@ def train(config: RunConfig, resume_from: str = None):
     devices = jax.devices()
     n_devices = len(devices)
     device = devices[0]
-    mesh = Mesh(mesh_utils.create_device_mesh((n_devices,)), axis_names=('data',))
-    data_sharding = NamedSharding(mesh, P('data', None))
-    window_sharding = NamedSharding(mesh, P(None, 'data', None))
+
     model_config = config.model
     train_config = config.train
+
+    # Data-parallel sharding: only shard batch across devices if it divides evenly.
+    # On TPU v5e-8 with batch_size=4, we can't split 4 across 8 devices, so replicate.
+    batch_divides = train_config.batch_size % n_devices == 0
+    n_sharded = n_devices if batch_divides else 1
+
+    if n_sharded > 1:
+        mesh = Mesh(mesh_utils.create_device_mesh((n_sharded,)), axis_names=('data',))
+        data_sharding = NamedSharding(mesh, P('data', None))
+        window_sharding = NamedSharding(mesh, P(None, 'data', None))
+    else:
+        # Batch too small to shard — replicate
+        mesh = Mesh(devices, ('data',))
+        data_sharding = NamedSharding(mesh, P(None, None))
+        window_sharding = NamedSharding(mesh, P(None, None, None))
+
+    if not batch_divides and n_devices > 1:
+        print(f"  WARNING: batch_size={train_config.batch_size} not divisible by {n_devices} devices; "
+              f"replicating data across devices. Consider setting batch_size to a multiple of {n_devices}.")
 
     compute_dtype = jnp.bfloat16 if model_config.compute_dtype == "bfloat16" else jnp.float32
     print(f"  Device: {device.device_kind} (x{n_devices})")
@@ -73,7 +90,7 @@ def train(config: RunConfig, resume_from: str = None):
     peak_tflops = 0.0
     for key, val in peak_tflops_map.items():
         if key.lower() in device_kind_lower:
-            peak_tflops = val * n_devices
+            peak_tflops = val * n_sharded
             break
 
     print(f"  Parameters: {n_params:,}")
@@ -124,7 +141,7 @@ def train(config: RunConfig, resume_from: str = None):
         def loss_fn(m):
             return forward_and_loss(m, batch, model_config, train_config, deterministic=False)
         (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
-        grads = jax.tree_util.tree_map(lambda g: g / n_devices, grads)
+        grads = jax.tree_util.tree_map(lambda g: g / n_sharded, grads)
         optimizer.update(model, grads)
         return loss, metrics
 
@@ -137,7 +154,7 @@ def train(config: RunConfig, resume_from: str = None):
                 def loss_fn(mdl):
                     return forward_and_loss(mdl, batch, model_config, train_config, deterministic=False)
                 (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(m)
-                grads = jax.tree_util.tree_map(lambda g: g / n_devices, grads)
+                grads = jax.tree_util.tree_map(lambda g: g / n_sharded, grads)
                 opt.update(m, grads)
                 _, new_state = nnx.split((m, opt))
                 return new_state, (loss, metrics)
