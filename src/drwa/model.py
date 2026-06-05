@@ -67,6 +67,7 @@ class DRWAModel(nnx.Module):
             max_seq_len=config.seq_len,
             use_rope=config.use_rope,
             dtype=compute_dtype,
+            remat=config.remat,
             rngs=rngs,
         )
 
@@ -88,6 +89,7 @@ class DRWAModel(nnx.Module):
             max_seq_len=config.seq_len,
             use_rope=config.use_rope,
             dtype=compute_dtype,
+            remat=config.remat,
             rngs=rngs,
         )
 

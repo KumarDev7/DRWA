@@ -34,7 +34,7 @@ model:
 
 train:
   total_steps: 50000
-  steps_per_window: 1
+  steps_per_window: 32
   batch_size: 4
   lr_pool: 3.0e-4
   lr_transformer: 1.0e-3
