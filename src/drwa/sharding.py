@@ -386,7 +386,7 @@ def get_data_shardings(
     if "model" in mesh.axis_names:
         return (
             NamedSharding(mesh, P("data", None, None)),
-            NamedSharding(mesh, P(None, "data", None, None)),
+            NamedSharding(mesh, P(None, "data", None)),
         )
     return (
         NamedSharding(mesh, P("data", None)),

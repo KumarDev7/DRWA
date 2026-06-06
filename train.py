@@ -142,7 +142,7 @@ def train(config: RunConfig, resume_from: str = None):
     log_every = train_config.log_every
 
     # pmean requires mesh context — wrap the entire training section
-    with mesh:
+    with jax.set_mesh(mesh):
 
         # === Compiled training functions ===
         # Single step (for steps_per_window=1)
