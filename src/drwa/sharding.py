@@ -113,8 +113,8 @@ _SHARDING_RULES: List[Tuple[str, P]] = [
     ("part_b/norm/scale", P(None)),
     ("part_b/norm/bias", P(None)),
 
-    ("lm_head/kernel", P(None, "model")),
-    ("lm_head/bias", P("model",)),
+    ("lm_head/kernel", P(None, None)),
+    ("lm_head/bias", P(None)),
 ]
 
 
@@ -316,6 +316,8 @@ def shard_model(
     if len(mesh.shape) <= 1 and "model" not in mesh.axis_names:
         return model
 
+    n_model = mesh.shape["model"] if "model" in mesh.axis_names else 1
+
     param_specs = get_param_sharding(model, mesh)
     graphdef, state = nnx.split(model)
 
@@ -324,14 +326,26 @@ def shard_model(
 
     for key, variable in flat_state.items():
         spec = param_specs.get(key, P())
+        arr = jnp.asarray(variable.value)
+
         if spec == P():
             sharded_flat[key] = variable
             continue
 
+        for axis_idx, axis_name in enumerate(spec.axis_names):
+            if axis_name is not None and axis_name == "model":
+                dim_size = arr.shape[axis_idx]
+                if dim_size % n_model != 0:
+                    path_str = "/".join(str(p) for p in key)
+                    raise ValueError(
+                        f"Cannot shard parameter '{path_str}' (shape {arr.shape}) "
+                        f"with spec {spec}: dimension {axis_idx} size {dim_size} "
+                        f"is not divisible by n_model={n_model}. "
+                        f"Change the PartitionSpec to replicate this dimension."
+                    )
+
         ns = NamedSharding(mesh, spec)
-        sharded_value = jax.device_put(
-            jnp.asarray(variable.value), ns
-        )
+        sharded_value = jax.device_put(arr, ns)
         sharded_flat[key] = variable.replace(value=sharded_value)
 
     sharded_state = nnx.traversals.unflatten_mapping(sharded_flat)
