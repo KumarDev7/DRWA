@@ -1,4 +1,4 @@
-# 3B dense config (TPU v5e-8 with 2D mesh sharding: 2 data x 4 model, layer scan enabled)
+# 3B dense config (TPU v5e-8 with 8-way model parallel, layer scan enabled)
 # ~3B params, d_model=2560, GQA 40 heads / 8 kv_heads
 model:
   vocab_size: 50257
@@ -35,8 +35,8 @@ train:
   grad_clip_norm: 1.0
 
 sharding:
-  n_data: 2
-  n_model: 4
+  n_data: 1
+  n_model: 8
 
 data:
   source: hf
