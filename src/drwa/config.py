@@ -156,6 +156,30 @@ class DRWAConfig:
             compute_dtype="bfloat16",
             remat=True,
         )
+
+    @classmethod
+    def dense_xl(cls) -> "DRWAConfig":
+        """3B dense configuration for TPU v5e-8 with model parallelism."""
+        return cls(
+            vocab_size=50257,
+            seq_len=2048,
+            d_model=2560,
+            d_ffn=10240,
+            d_A=2560,
+            d_B=2560,
+            N=1,
+            k_max=1,
+            r=64,
+            S=4,
+            d_k=256,
+            n_layers_A=20,
+            n_layers_B=20,
+            n_heads=40,
+            n_kv_heads=8,  # GQA ratio 5:1
+            bf16_pool=True,
+            compute_dtype="bfloat16",
+            remat=True,
+        )
     
     @classmethod
     def drwa_expanded(cls, N: int = 1024) -> "DRWAConfig":
@@ -180,21 +204,39 @@ class DRWAConfig:
     
     @property
     def total_params(self) -> int:
-        """Approximate total parameter count."""
+        """Approximate total parameter count including GQA."""
+        head_dim = self.d_model // self.n_heads
+        d_kv = self.n_kv_heads * head_dim
+
         # Embedding
         embed_params = self.vocab_size * self.d_model
-        
-        # Transformer layers
-        layer_params = (4 * self.d_model ** 2) + (2 * self.d_ffn * self.d_model)
-        transformer_params = (self.n_layers_A + self.n_layers_B) * layer_params
-        
-        # Pool (N vectors)
-        pool_params = self.N * self.pool_dim if self.N > 1 else self.d_ffn * self.d_model
-        
-        # Retrieval (S aspects)
-        retrieval_params = self.S * (self.d_model + self.d_k) * self.d_model
-        
-        return embed_params + transformer_params + pool_params + retrieval_params
+
+        # Per transformer block: attention + FFN + norms + biases
+        # Attention: wq(d,d) + wk(d,d_kv) + wv(d,d_kv) + wo(d,d)
+        attn_params = 2 * self.d_model ** 2 + 2 * self.d_model * d_kv
+        # Add biases for all 4 projections
+        attn_params += self.d_model + d_kv + d_kv + self.d_model
+        # FFN: w1(d,d_ffn) + w2(d_ffn,d) + biases
+        ffn_params = self.d_model * self.d_ffn + self.d_ffn * self.d_model + self.d_ffn + self.d_model
+        # LayerNorms: 2 per block, each with weight + bias
+        norm_params = 4 * self.d_model
+        layer_params = attn_params + ffn_params + norm_params
+
+        n_layers = self.n_layers_A + self.n_layers_B
+        transformer_params = n_layers * layer_params
+
+        # Part A / Part B final norms
+        final_norm_params = 4 * self.d_model
+
+        # Assembly (N=1): W_base(d_B,d_A) + b_base(d_B) + U(d_B,r) + V(r,d_A) + b(d_B) + gamma(1) + norm(2*d_B)
+        assembly_params = self.d_B * self.d_A + self.d_B + self.d_B * self.r + self.r * self.d_A + self.d_B + 1 + 2 * self.d_B
+        if self.d_A != self.d_B:
+            assembly_params += self.d_A * self.d_B
+
+        # LM head
+        lm_head_params = self.d_B * self.vocab_size + self.vocab_size
+
+        return embed_params + transformer_params + final_norm_params + assembly_params + lm_head_params
 
 
 @dataclass

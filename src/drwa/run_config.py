@@ -110,6 +110,7 @@ class RunConfig:
         - "dense_small": Small dense (test)
         - "dense_medium": Medium dense (125M)
         - "dense_large": Large dense (350M)
+        - "dense_xl": XL dense (3B, TPU v5e-8)
         - "drwa_1b": DRWA expanded 1B
         - "drwa_3b": DRWA expanded 3B
         """
@@ -117,6 +118,7 @@ class RunConfig:
             "dense_small": DRWAConfig.dense_small,
             "dense_medium": DRWAConfig.dense_medium,
             "dense_large": DRWAConfig.dense_large,
+            "dense_xl": DRWAConfig.dense_xl,
             "dense_colab": DRWAConfig.dense_colab,
             "drwa_1b": lambda: DRWAConfig.drwa_expanded(N=1024),
             "drwa_3b": lambda: DRWAConfig.drwa_expanded(N=2048),
@@ -144,11 +146,11 @@ def load_config(path_or_preset: str) -> RunConfig:
     
     if path_obj.exists():
         return RunConfig.load(path_or_preset)
-    elif path_or_preset in ["dense_small", "dense_medium", "dense_large", "dense_colab", "drwa_1b", "drwa_3b"]:
+    elif path_or_preset in ["dense_small", "dense_medium", "dense_large", "dense_xl", "dense_colab", "drwa_1b", "drwa_3b"]:
         return RunConfig.from_preset(path_or_preset)
     else:
         raise ValueError(f"Config not found: {path_or_preset}. "
-                        f"Provide a YAML path or preset: dense_small, dense_medium, dense_large, drwa_1b, drwa_3b")
+                        f"Provide a YAML path or preset: dense_small, dense_medium, dense_large, dense_xl, drwa_1b, drwa_3b")
 
 
 def save_config(config: RunConfig, path: str) -> None:

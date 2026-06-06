@@ -1,0 +1,54 @@
+# 3B dense config (TPU v5e-8 with 2D mesh sharding: 2 data x 4 model)
+# ~3B params, d_model=2560, GQA 40 heads / 8 kv_heads
+model:
+  vocab_size: 50257
+  seq_len: 2048
+  d_model: 2560
+  d_ffn: 10240
+  N: 1
+  k_max: 1
+  r: 64
+  S: 4
+  d_k: 256
+  d_A: 2560
+  d_B: 2560
+  num_loops: 3
+  halt_threshold: 0.99
+  lambda_gate: 3.0
+  gamma_init: 0.05
+  use_rope: true
+  n_layers_A: 20
+  n_layers_B: 20
+  n_heads: 40
+  n_kv_heads: 8
+  bf16_pool: true
+  compute_dtype: bfloat16
+  remat: true
+
+train:
+  total_steps: 200000
+  steps_per_window: 32
+  batch_size: 4
+  lr_pool: 1.5e-4
+  lr_transformer: 6.0e-5
+  warmup_steps: 2000
+  grad_clip_norm: 1.0
+
+sharding:
+  n_data: 2
+  n_model: 4
+
+data:
+  source: hf
+  hf_path: Skylion007/openwebtext
+  hf_text_column: text
+  hf_tokenizer: gpt2
+
+checkpoint:
+  dir: checkpoints/dense_3b
+  every: 5000
+  keep: 3
+
+wandb:
+  project: drwa
+  name: dense_3b

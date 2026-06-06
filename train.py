@@ -12,13 +12,13 @@ from flax import nnx
 import optax
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
-from jax.experimental import mesh_utils
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from drwa.config import DRWAConfig, TrainConfig
 from drwa.run_config import RunConfig, load_config
 from drwa.model import DRWAModel, forward_and_loss, compute_step_flops, count_params
+from drwa.sharding import create_mesh, shard_model, get_data_shardings
 from drwa.data import create_data_loader
 from drwa.checkpoint import CheckpointManager, MetricsLogger
 
@@ -50,32 +50,39 @@ def train(config: RunConfig, resume_from: str = None):
     model_config = config.model
     train_config = config.train
 
-    # Data-parallel sharding: only shard batch across devices if it divides evenly.
-    # On TPU v5e-8 with batch_size=4, we can't split 4 across 8 devices, so replicate.
-    batch_divides = train_config.batch_size % n_devices == 0
-    n_sharded = n_devices if batch_divides else 1
+    # Create 1D or 2D device mesh based on sharding config.
+    # 1D (n_model=1): data-parallel only, all weights replicated.
+    # 2D (n_model>1): data parallel on 'data' axis, model parallel on 'model' axis.
+    mesh, mesh_info = create_mesh(config.sharding, devices)
+    n_data = mesh_info["n_data"]
+    n_model = mesh_info["n_model"]
+    is_2d = mesh_info["is_2d"]
 
-    if n_sharded > 1:
-        mesh = Mesh(mesh_utils.create_device_mesh((n_sharded,)), axis_names=('data',))
-        data_sharding = NamedSharding(mesh, P('data', None))
-        window_sharding = NamedSharding(mesh, P(None, 'data', None))
+    # Validate batch divides across data-parallel axis
+    if is_2d:
+        if train_config.batch_size % n_data != 0:
+            print(f"  WARNING: batch_size={train_config.batch_size} not divisible by n_data={n_data}; "
+                  f"replicating data across data axis.")
+        n_sharded = n_data if train_config.batch_size % n_data == 0 else 1
     else:
-        # Batch too small to shard — replicate
-        mesh = Mesh(devices, ('data',))
-        data_sharding = NamedSharding(mesh, P(None, None))
-        window_sharding = NamedSharding(mesh, P(None, None, None))
+        batch_divides = train_config.batch_size % n_devices == 0
+        n_sharded = n_devices if batch_divides else 1
 
-    if not batch_divides and n_devices > 1:
-        print(f"  WARNING: batch_size={train_config.batch_size} not divisible by {n_devices} devices; "
-              f"replicating data across devices. Consider setting batch_size to a multiple of {n_devices}.")
+    data_sharding, window_sharding = get_data_shardings(mesh)
 
     compute_dtype = jnp.bfloat16 if model_config.compute_dtype == "bfloat16" else jnp.float32
+    sharding_type = f"2D ({n_data} data x {n_model} model)" if is_2d else f"1D (data x {n_sharded})"
     print(f"  Device: {device.device_kind} (x{n_devices})")
     print(f"  Compute dtype: {compute_dtype}")
     print(f"  Remat: {model_config.remat}")
+    print(f"  Sharding: {sharding_type}")
 
     rngs = nnx.Rngs(train_config.seed)
     model = DRWAModel(model_config, rngs=rngs)
+
+    # Apply model sharding for 2D meshes (no-op for 1D)
+    if is_2d:
+        model = shard_model(model, mesh)
 
     n_params = count_params(model)
     step_flops = compute_step_flops(model_config, train_config.batch_size)
@@ -134,157 +141,164 @@ def train(config: RunConfig, resume_from: str = None):
     total_steps = train_config.total_steps
     log_every = train_config.log_every
 
-    # === Compiled training functions ===
-    # Single step (for steps_per_window=1)
-    @nnx.jit
-    def train_step(model, optimizer, batch):
-        def loss_fn(m):
-            return forward_and_loss(m, batch, model_config, train_config, deterministic=False)
-        (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
-        grads = jax.tree_util.tree_map(lambda g: g / n_sharded, grads)
-        optimizer.update(model, grads)
-        return loss, metrics
+    # pmean requires mesh context — wrap the entire training section
+    with mesh:
 
-    if steps_per_window > 1:
+        # === Compiled training functions ===
+        # Single step (for steps_per_window=1)
         @nnx.jit
-        def train_window(model, optimizer, data):
-            graphdef, state = nnx.split((model, optimizer))
-            def step_fn(carry_state, batch):
-                m, opt = nnx.merge(graphdef, carry_state)
-                def loss_fn(mdl):
-                    return forward_and_loss(mdl, batch, model_config, train_config, deterministic=False)
-                (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(m)
-                grads = jax.tree_util.tree_map(lambda g: g / n_sharded, grads)
-                opt.update(m, grads)
-                _, new_state = nnx.split((m, opt))
-                return new_state, (loss, metrics)
-            final_state, (losses, metrics) = jax.lax.scan(step_fn, state, data)
-            nnx.update((model, optimizer), final_state)
-            return jnp.mean(losses), metrics
+        def train_step(model, optimizer, batch):
+            def loss_fn(m):
+                return forward_and_loss(m, batch, model_config, train_config, deterministic=False)
+            (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+            grads = jax.lax.pmean(grads, axis_name='data')
+            loss = jax.lax.pmean(loss, axis_name='data')
+            metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name='data'), metrics)
+            optimizer.update(model, grads)
+            return loss, metrics
 
-    print(f"\n  Compiling...")
-    warmup_data = loader.get_window(steps_per_window if steps_per_window > 1 else 1)
-    if steps_per_window > 1:
-        warmup_input = jax.device_put(warmup_data, window_sharding)
-    else:
-        warmup_input = jax.device_put(warmup_data[0], data_sharding)
+        if steps_per_window > 1:
+            @nnx.jit
+            def train_window(model, optimizer, data):
+                graphdef, state = nnx.split((model, optimizer))
+                def step_fn(carry_state, batch):
+                    m, opt = nnx.merge(graphdef, carry_state)
+                    def loss_fn(mdl):
+                        return forward_and_loss(mdl, batch, model_config, train_config, deterministic=False)
+                    (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(m)
+                    grads = jax.lax.pmean(grads, axis_name='data')
+                    loss = jax.lax.pmean(loss, axis_name='data')
+                    metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name='data'), metrics)
+                    opt.update(m, grads)
+                    _, new_state = nnx.split((m, opt))
+                    return new_state, (loss, metrics)
+                final_state, (losses, metrics) = jax.lax.scan(step_fn, state, data)
+                nnx.update((model, optimizer), final_state)
+                return jnp.mean(losses), metrics
 
-    t0 = time.time()
-    if steps_per_window > 1:
-        _ = train_window(model, optimizer, warmup_input)
-    else:
-        _ = train_step(model, optimizer, warmup_input)
-    jax.block_until_ready(_)
-    compile_time = time.time() - t0
-    print(f"  Compiled in {compile_time:.1f}s")
+        print(f"\n  Compiling...")
+        warmup_data = loader.get_window(steps_per_window if steps_per_window > 1 else 1)
+        if steps_per_window > 1:
+            warmup_input = jax.device_put(warmup_data, window_sharding)
+        else:
+            warmup_input = jax.device_put(warmup_data[0], data_sharding)
 
-    print(f"\n  Training {total_steps} steps ({total_steps // steps_per_window} windows of {steps_per_window})")
-    print("-" * 78)
-    print(f"  {'step':>7} {'loss':>8} {'ppl':>8} {'tks/s':>8} {'TFLOP/s':>8} {'MFU%':>6} {'elapsed':>8}")
-    print("-" * 78)
+        t0 = time.time()
+        if steps_per_window > 1:
+            _ = train_window(model, optimizer, warmup_input)
+        else:
+            _ = train_step(model, optimizer, warmup_input)
+        jax.block_until_ready(_)
+        compile_time = time.time() - t0
+        print(f"  Compiled in {compile_time:.1f}s")
 
-    losses = []
-    ss_steps = 0
-    ss_time = 0.0
-    min_win_time = float("inf")
-    start_time = time.time()
+        print(f"\n  Training {total_steps} steps ({total_steps // steps_per_window} windows of {steps_per_window})")
+        print("-" * 78)
+        print(f"  {'step':>7} {'loss':>8} {'ppl':>8} {'tks/s':>8} {'TFLOP/s':>8} {'MFU%':>6} {'elapsed':>8}")
+        print("-" * 78)
 
-    if steps_per_window > 1:
-        n_windows = (total_steps - start_step) // steps_per_window
-        data_np = loader.get_window(steps_per_window)
-        data = jax.device_put(data_np, window_sharding)
+        losses = []
+        ss_steps = 0
+        ss_time = 0.0
+        min_win_time = float("inf")
+        start_time = time.time()
 
-        for window_idx in range(n_windows):
-            step = start_step + window_idx * steps_per_window
+        if steps_per_window > 1:
+            n_windows = (total_steps - start_step) // steps_per_window
+            data_np = loader.get_window(steps_per_window)
+            data = jax.device_put(data_np, window_sharding)
 
-            win_t0 = time.time()
-            loss, window_metrics = train_window(model, optimizer, data)
-            loss_val = float(jax.block_until_ready(loss))
-            win_time = time.time() - win_t0
+            for window_idx in range(n_windows):
+                step = start_step + window_idx * steps_per_window
 
-            sps = steps_per_window / win_time if win_time > 0 else 0
-            tps = sps * tokens_per_step
-            tflops = step_flops * sps / 1e12 if sps > 0 else 0
-            mfu = (tflops / peak_tflops * 100) if peak_tflops > 0 else 0
+                win_t0 = time.time()
+                loss, window_metrics = train_window(model, optimizer, data)
+                loss_val = float(jax.block_until_ready(loss))
+                win_time = time.time() - win_t0
 
-            is_compile = win_time > 3.0 * min_win_time if min_win_time < float("inf") else (window_idx < 1)
-            if not is_compile:
-                ss_steps += steps_per_window
-                ss_time += win_time
-            min_win_time = min(min_win_time, win_time)
+                sps = steps_per_window / win_time if win_time > 0 else 0
+                tps = sps * tokens_per_step
+                tflops = step_flops * sps / 1e12 if sps > 0 else 0
+                mfu = (tflops / peak_tflops * 100) if peak_tflops > 0 else 0
 
-            for _ in range(steps_per_window):
+                is_compile = win_time > 3.0 * min_win_time if min_win_time < float("inf") else (window_idx < 1)
+                if not is_compile:
+                    ss_steps += steps_per_window
+                    ss_time += win_time
+                min_win_time = min(min_win_time, win_time)
+
+                for _ in range(steps_per_window):
+                    losses.append(loss_val)
+
+                if window_idx % max(1, log_every // steps_per_window) == 0:
+                    elapsed = time.time() - start_time
+                    window = min(len(losses), steps_per_window)
+                    avg_loss = np.mean(losses[-window:])
+                    print(
+                        f"  {step:7d} {avg_loss:8.4f} {float(np.exp(avg_loss)):8.2f} "
+                        f"{tps:8.0f} {tflops:8.2f} {mfu:5.1f}% "
+                        f"{time.strftime('%H:%M:%S', time.gmtime(elapsed))}"
+                    )
+
+                metrics_logger.log({
+                    "loss": loss_val, "perplexity": float(np.exp(loss_val)),
+                    "tokens_per_sec": tps, "tflops": tflops, "mfu_pct": mfu,
+                    "step_time_sec": win_time / steps_per_window,
+                }, step=step)
+
+                if step > 0 and step % config.checkpoint.every == 0:
+                    ckpt_manager.save(model, optimizer, step, metrics={"loss": loss_val})
+
+                if window_idx < n_windows - 1:
+                    data_np = loader.get_window(steps_per_window)
+                    data = jax.device_put(data_np, window_sharding)
+
+            final_step = start_step + n_windows * steps_per_window
+        else:
+            batch_np = loader.get_window(1)
+            for step in range(start_step, total_steps):
+                batch = jax.device_put(batch_np[0], data_sharding)
+
+                step_t0 = time.time()
+                loss, metrics = train_step(model, optimizer, batch)
+                loss_val = float(jax.block_until_ready(loss))
+                step_time = time.time() - step_t0
                 losses.append(loss_val)
 
-            if window_idx % max(1, log_every // steps_per_window) == 0:
-                elapsed = time.time() - start_time
-                window = min(len(losses), steps_per_window)
-                avg_loss = np.mean(losses[-window:])
-                print(
-                    f"  {step:7d} {avg_loss:8.4f} {float(np.exp(avg_loss)):8.2f} "
-                    f"{tps:8.0f} {tflops:8.2f} {mfu:5.1f}% "
-                    f"{time.strftime('%H:%M:%S', time.gmtime(elapsed))}"
-                )
+                sps = 1.0 / step_time if step_time > 0 else 0
+                tps = sps * tokens_per_step
+                tflops = step_flops * sps / 1e12 if sps > 0 else 0
+                mfu = (tflops / peak_tflops * 100) if peak_tflops > 0 else 0
 
-            metrics_logger.log({
-                "loss": loss_val, "perplexity": float(np.exp(loss_val)),
-                "tokens_per_sec": tps, "tflops": tflops, "mfu_pct": mfu,
-                "step_time_sec": win_time / steps_per_window,
-            }, step=step)
+                is_compile = step_time > 3.0 * min_win_time if min_win_time < float("inf") else (step < 1)
+                if not is_compile:
+                    ss_steps += 1
+                    ss_time += step_time
+                min_win_time = min(min_win_time, step_time)
 
-            if step > 0 and step % config.checkpoint.every == 0:
-                ckpt_manager.save(model, optimizer, step, metrics={"loss": loss_val})
+                if step % log_every == 0:
+                    elapsed = time.time() - start_time
+                    window = min(len(losses), log_every) if log_every > 0 else len(losses)
+                    avg_loss = np.mean(losses[-window:])
+                    print(
+                        f"  {step:7d} {avg_loss:8.4f} {float(np.exp(avg_loss)):8.2f} "
+                        f"{tps:8.0f} {tflops:8.2f} {mfu:5.1f}% "
+                        f"{time.strftime('%H:%M:%S', time.gmtime(elapsed))}"
+                    )
 
-            if window_idx < n_windows - 1:
-                data_np = loader.get_window(steps_per_window)
-                data = jax.device_put(data_np, window_sharding)
+                metrics_logger.log({
+                    "loss": loss_val, "perplexity": float(np.exp(loss_val)),
+                    "tokens_per_sec": tps, "tflops": tflops, "mfu_pct": mfu,
+                    "step_time_sec": step_time,
+                }, step=step)
 
-        final_step = start_step + n_windows * steps_per_window
-    else:
-        batch_np = loader.get_window(1)
-        for step in range(start_step, total_steps):
-            batch = jax.device_put(batch_np[0], data_sharding)
+                if step > 0 and step % config.checkpoint.every == 0:
+                    ckpt_manager.save(model, optimizer, step, metrics={"loss": loss_val})
 
-            step_t0 = time.time()
-            loss, metrics = train_step(model, optimizer, batch)
-            loss_val = float(jax.block_until_ready(loss))
-            step_time = time.time() - step_t0
-            losses.append(loss_val)
+                if step < total_steps - 1:
+                    batch_np = loader.get_window(1)
 
-            sps = 1.0 / step_time if step_time > 0 else 0
-            tps = sps * tokens_per_step
-            tflops = step_flops * sps / 1e12 if sps > 0 else 0
-            mfu = (tflops / peak_tflops * 100) if peak_tflops > 0 else 0
-
-            is_compile = step_time > 3.0 * min_win_time if min_win_time < float("inf") else (step < 1)
-            if not is_compile:
-                ss_steps += 1
-                ss_time += step_time
-            min_win_time = min(min_win_time, step_time)
-
-            if step % log_every == 0:
-                elapsed = time.time() - start_time
-                window = min(len(losses), log_every) if log_every > 0 else len(losses)
-                avg_loss = np.mean(losses[-window:])
-                print(
-                    f"  {step:7d} {avg_loss:8.4f} {float(np.exp(avg_loss)):8.2f} "
-                    f"{tps:8.0f} {tflops:8.2f} {mfu:5.1f}% "
-                    f"{time.strftime('%H:%M:%S', time.gmtime(elapsed))}"
-                )
-
-            metrics_logger.log({
-                "loss": loss_val, "perplexity": float(np.exp(loss_val)),
-                "tokens_per_sec": tps, "tflops": tflops, "mfu_pct": mfu,
-                "step_time_sec": step_time,
-            }, step=step)
-
-            if step > 0 and step % config.checkpoint.every == 0:
-                ckpt_manager.save(model, optimizer, step, metrics={"loss": loss_val})
-
-            if step < total_steps - 1:
-                batch_np = loader.get_window(1)
-
-        final_step = total_steps
+            final_step = total_steps
 
     ckpt_manager.save(model, optimizer, final_step, metrics={"final": True})
     metrics_logger.save()
@@ -311,7 +325,7 @@ def train(config: RunConfig, resume_from: str = None):
 def main():
     parser = argparse.ArgumentParser(description="Train DRWA model")
     parser.add_argument("--config", type=str, required=True,
-                        help="Config YAML path or preset: dense_small, dense_medium, dense_large, dense_colab")
+                        help="Config YAML path or preset: dense_small, dense_medium, dense_large, dense_xl, dense_colab")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path")
     args = parser.parse_args()
 

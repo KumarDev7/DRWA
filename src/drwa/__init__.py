@@ -11,6 +11,7 @@ __version__ = "0.1.0"
 from .model import DRWAModel, forward_and_loss, compute_step_flops, count_params
 from .config import DRWAConfig, TrainConfig
 from .run_config import RunConfig, load_config, save_config
+from .sharding import create_mesh, get_param_sharding, shard_model, get_data_shardings, shard_data
 
 __all__ = [
     "DRWAModel",
@@ -22,4 +23,9 @@ __all__ = [
     "count_params",
     "load_config",
     "save_config",
+    "create_mesh",
+    "get_param_sharding",
+    "shard_model",
+    "get_data_shardings",
+    "shard_data",
 ]
