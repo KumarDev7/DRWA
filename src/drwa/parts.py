@@ -22,13 +22,14 @@ def apply_rope(x, cos, sin):
 
 
 class CausalSelfAttention(nnx.Module):
-    def __init__(self, d_model, n_heads, n_kv_heads, max_seq_len, use_rope=True, dtype=jnp.float32, rngs=None):
+    def __init__(self, d_model, n_heads, n_kv_heads, max_seq_len, use_rope=True, dtype=jnp.float32, rngs=None, model_axis=None):
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = d_model // n_heads
         self.use_rope = use_rope
         self.dtype = dtype
+        self.model_axis = model_axis
         self.wq = nnx.Linear(d_model, n_heads * self.head_dim, dtype=dtype, rngs=rngs)
         self.wk = nnx.Linear(d_model, n_kv_heads * self.head_dim, dtype=dtype, rngs=rngs)
         self.wv = nnx.Linear(d_model, n_kv_heads * self.head_dim, dtype=dtype, rngs=rngs)
@@ -42,9 +43,18 @@ class CausalSelfAttention(nnx.Module):
 
     def __call__(self, x, mask=None, deterministic=True):
         B, T, d = x.shape
-        q = self.wq(x).reshape(B, T, self.n_heads, self.head_dim)
-        k = self.wk(x).reshape(B, T, self.n_kv_heads, self.head_dim)
-        v = self.wv(x).reshape(B, T, self.n_kv_heads, self.head_dim)
+        # Under shard_map the q/k/v projections are column-parallel: each device
+        # holds only n_heads/n_model (and n_kv_heads/n_model) heads locally, so
+        # the reshapes must use the per-device head counts.
+        n_heads = self.n_heads
+        n_kv_heads = self.n_kv_heads
+        if self.model_axis is not None:
+            n_model = jax.lax.axis_size(self.model_axis)
+            n_heads = n_heads // n_model
+            n_kv_heads = n_kv_heads // n_model
+        q = self.wq(x).reshape(B, T, n_heads, self.head_dim)
+        k = self.wk(x).reshape(B, T, n_kv_heads, self.head_dim)
+        v = self.wv(x).reshape(B, T, n_kv_heads, self.head_dim)
         if self.use_rope:
             q = apply_rope(q, self.cos.value, self.sin.value)
             k = apply_rope(k, self.cos.value, self.sin.value)
@@ -53,26 +63,33 @@ class CausalSelfAttention(nnx.Module):
             is_causal=True,
             mask=mask,
         )
-        out = out.reshape(B, T, self.n_heads * self.head_dim)
-        return self.wo(out)
+        out = out.reshape(B, T, n_heads * self.head_dim)
+        out = self.wo(out)
+        if self.model_axis is not None:
+            out = jax.lax.psum(out, self.model_axis)
+        return out
 
 
 class FFN(nnx.Module):
-    def __init__(self, d_model, d_ffn, dtype=jnp.float32, rngs=None):
+    def __init__(self, d_model, d_ffn, dtype=jnp.float32, rngs=None, model_axis=None):
         self.w1 = nnx.Linear(d_model, d_ffn, dtype=dtype, rngs=rngs)
         self.w2 = nnx.Linear(d_ffn, d_model, dtype=dtype, rngs=rngs)
         self.dtype = dtype
+        self.model_axis = model_axis
 
     def __call__(self, x):
-        return self.w2(jax.nn.gelu(self.w1(x)))
+        h = self.w2(jax.nn.gelu(self.w1(x)))
+        if self.model_axis is not None:
+            h = jax.lax.psum(h, self.model_axis)
+        return h
 
 
 class TransformerBlock(nnx.Module):
-    def __init__(self, d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope=True, dtype=jnp.float32, remat=False, rngs=None):
+    def __init__(self, d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope=True, dtype=jnp.float32, remat=False, rngs=None, model_axis=None):
         self.norm1 = nnx.LayerNorm(d_model, dtype=dtype, rngs=rngs)
         self.norm2 = nnx.LayerNorm(d_model, dtype=dtype, rngs=rngs)
-        self.attn = CausalSelfAttention(d_model, n_heads, n_kv_heads, max_seq_len, use_rope, dtype, rngs)
-        self.ffn = FFN(d_model, d_ffn, dtype, rngs)
+        self.attn = CausalSelfAttention(d_model, n_heads, n_kv_heads, max_seq_len, use_rope, dtype, rngs, model_axis=model_axis)
+        self.ffn = FFN(d_model, d_ffn, dtype, rngs, model_axis=model_axis)
         self._remat = remat
 
     def __call__(self, x, mask=None, deterministic=True):
@@ -90,9 +107,9 @@ class TransformerBlock(nnx.Module):
 
 
 class PartA(nnx.Module):
-    def __init__(self, d_model, n_layers, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope=True, dtype=jnp.float32, remat=False, rngs=None):
+    def __init__(self, d_model, n_layers, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope=True, dtype=jnp.float32, remat=False, rngs=None, model_axis=None):
         self.layers = nnx.List([
-            TransformerBlock(d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope, dtype, remat, rngs)
+            TransformerBlock(d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope, dtype, remat, rngs, model_axis=model_axis)
             for _ in range(n_layers)
         ])
         self.norm = nnx.LayerNorm(d_model, dtype=dtype, rngs=rngs)
@@ -104,9 +121,9 @@ class PartA(nnx.Module):
 
 
 class PartB(nnx.Module):
-    def __init__(self, d_model, n_layers, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope=True, dtype=jnp.float32, remat=False, rngs=None):
+    def __init__(self, d_model, n_layers, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope=True, dtype=jnp.float32, remat=False, rngs=None, model_axis=None):
         self.layers = nnx.List([
-            TransformerBlock(d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope, dtype, remat, rngs)
+            TransformerBlock(d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope, dtype, remat, rngs, model_axis=model_axis)
             for _ in range(n_layers)
         ])
         self.norm = nnx.LayerNorm(d_model, dtype=dtype, rngs=rngs)

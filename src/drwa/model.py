@@ -23,10 +23,12 @@ class SimpleAssembly(nnx.Module):
         gamma_init: float,
         dtype=jnp.float32,
         rngs: nnx.Rngs = None,
+        model_axis: str = None,
     ):
         self.d_A = d_A
         self.d_B = d_B
         self.r = r
+        self.model_axis = model_axis
 
         self.W_base = nnx.Param(
             jax.random.normal(rngs.params(), (d_B, d_A), dtype=dtype) * 0.02
@@ -48,14 +50,17 @@ class SimpleAssembly(nnx.Module):
 
     def __call__(self, h_A):
         h_proj = self.proj(h_A) if self.d_A != self.d_B else h_A
+        # Assembly weights are replicated across the model axis (see sharding.py),
+        # so h_res is computed identically on every device — no collective needed.
         h_res = h_A @ self.W_base.value.T + (h_A @ self.V.value.T) @ self.U.value.T + (self.b_base.value + self.b.value)[None, None, :]
         h_mid = self.norm(h_proj + self.gamma.value[0] * h_res)
         return h_mid, {}
 
 
 class DRWAModel(nnx.Module):
-    def __init__(self, config: DRWAConfig, rngs: nnx.Rngs):
+    def __init__(self, config: DRWAConfig, rngs: nnx.Rngs, model_axis: str = None):
         self.config = config
+        self.model_axis = model_axis
         compute_dtype = jnp.bfloat16 if config.compute_dtype == "bfloat16" else jnp.float32
 
         self.embed = nnx.Embed(config.vocab_size, config.d_model, dtype=compute_dtype, rngs=rngs)
@@ -71,6 +76,7 @@ class DRWAModel(nnx.Module):
             dtype=compute_dtype,
             remat=config.remat,
             rngs=rngs,
+            model_axis=model_axis,
         )
 
         self.assembly = SimpleAssembly(
@@ -80,6 +86,7 @@ class DRWAModel(nnx.Module):
             gamma_init=config.gamma_init,
             dtype=compute_dtype,
             rngs=rngs,
+            model_axis=model_axis,
         )
 
         self.part_b = PartB(
@@ -93,13 +100,16 @@ class DRWAModel(nnx.Module):
             dtype=compute_dtype,
             remat=config.remat,
             rngs=rngs,
+            model_axis=model_axis,
         )
 
-        self.lm_head = nnx.Linear(config.d_B, config.vocab_size, rngs=rngs)
+        self.lm_head = nnx.Linear(config.d_B, config.vocab_size, dtype=compute_dtype, rngs=rngs)
 
     def __call__(self, input_ids: jnp.ndarray, deterministic: bool = True) -> Tuple[jnp.ndarray, dict]:
         B, T = input_ids.shape
 
+        # Embedding is replicated across the model axis (see sharding.py), so the
+        # output is already the full, replicated d_model on every device.
         h = self.embed(input_ids)
 
         h_A = self.part_a(h, deterministic=deterministic)

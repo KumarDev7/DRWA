@@ -74,7 +74,10 @@ def _path_str(path: Tuple) -> str:
 #   Replicated:      P(None) / P()     — no sharding
 
 _SHARDING_RULES: List[Tuple[str, P]] = [
-    ("embed/embedding", P(None, "model")),
+    # vocab_size (50257) is not divisible by n_model, and the embedding output
+    # feeds layers that expect a full, replicated d_model hidden state — so the
+    # embedding table is replicated (matching the replicated lm_head below).
+    ("embed/embedding", P()),
 
     ("attn/wq/kernel", P(None, "model")),
     ("attn/wq/bias", P("model",)),
@@ -97,16 +100,18 @@ _SHARDING_RULES: List[Tuple[str, P]] = [
     ("norm2/scale", P(None)),
     ("norm2/bias", P(None)),
 
-    ("assembly/W_base", P("model", None)),
-    ("assembly/b_base", P("model",)),
+    # Assembly is a single tiny block; replicate it so it produces a full,
+    # replicated d_B hidden state for part_b without any collective.
+    ("assembly/W_base", P()),
+    ("assembly/b_base", P()),
     ("assembly/gamma", P(None)),
-    ("assembly/U", P("model", None)),
+    ("assembly/U", P()),
     ("assembly/V", P(None, None)),
-    ("assembly/b", P("model",)),
+    ("assembly/b", P()),
     ("assembly/norm/scale", P(None)),
     ("assembly/norm/bias", P(None)),
-    ("assembly/proj/kernel", P(None, "model")),
-    ("assembly/proj/bias", P("model",)),
+    ("assembly/proj/kernel", P()),
+    ("assembly/proj/bias", P()),
 
     ("part_a/norm/scale", P(None)),
     ("part_a/norm/bias", P(None)),

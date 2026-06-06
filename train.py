@@ -13,6 +13,8 @@ import optax
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
+shard_map = jax.shard_map
+
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from drwa.config import DRWAConfig, TrainConfig
@@ -78,7 +80,8 @@ def train(config: RunConfig, resume_from: str = None):
     print(f"  Sharding: {sharding_type}")
 
     rngs = nnx.Rngs(train_config.seed)
-    model = DRWAModel(model_config, rngs=rngs)
+    model_axis_name = 'model' if is_2d else None
+    model = DRWAModel(model_config, rngs=rngs, model_axis=model_axis_name)
 
     # Apply model sharding for 2D meshes (no-op for 1D)
     if is_2d:
@@ -97,7 +100,10 @@ def train(config: RunConfig, resume_from: str = None):
     peak_tflops = 0.0
     for key, val in peak_tflops_map.items():
         if key.lower() in device_kind_lower:
-            peak_tflops = val * n_sharded
+            # step_flops is the *global* per-step compute; under both data- and
+            # model-parallelism every device contributes FLOPs, so the aggregate
+            # peak is per-chip-peak times the total device count.
+            peak_tflops = val * n_devices
             break
 
     print(f"  Parameters: {n_params:,}")
@@ -141,40 +147,79 @@ def train(config: RunConfig, resume_from: str = None):
     total_steps = train_config.total_steps
     log_every = train_config.log_every
 
-    # pmean requires mesh context — wrap the entire training section
     with jax.set_mesh(mesh):
 
-        # === Compiled training functions ===
-        # Single step (for steps_per_window=1)
-        @nnx.jit
-        def train_step(model, optimizer, batch):
-            def loss_fn(m):
-                return forward_and_loss(m, batch, model_config, train_config, deterministic=False)
-            (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
-            grads = jax.lax.pmean(grads, axis_name='data')
-            loss = jax.lax.pmean(loss, axis_name='data')
-            metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name='data'), metrics)
-            optimizer.update(model, grads)
-            return loss, metrics
+        graphdef, state0 = nnx.split((model, optimizer))
+
+        def _state_specs(state):
+            def _leaf_spec(x):
+                if hasattr(x, 'sharding') and isinstance(x.sharding, NamedSharding):
+                    return x.sharding.spec
+                return P()
+            orig_treedef = jax.tree_util.tree_structure(state)
+            leaves = jax.tree_util.tree_leaves(state)
+            specs = [_leaf_spec(leaf) for leaf in leaves]
+            return jax.tree_util.tree_unflatten(orig_treedef, specs)
+
+        state_specs = _state_specs(state0)
+        pmean_fn = lambda x: jax.lax.pmean(x, axis_name='data')
+
+        if steps_per_window <= 1:
+            def _train_step_core(state, batch):
+                m, opt = nnx.merge(graphdef, state)
+                (loss, metrics), grads = nnx.value_and_grad(
+                    lambda mdl: forward_and_loss(mdl, batch, model_config, train_config, deterministic=False),
+                    has_aux=True,
+                )(m)
+                grads = jax.tree_util.tree_map(pmean_fn, grads)
+                loss = pmean_fn(loss)
+                metrics = jax.tree_util.tree_map(pmean_fn, metrics)
+                opt.update(m, grads)
+                _, new_state = nnx.split((m, opt))
+                return new_state, loss, metrics
+
+            train_step_core = jax.jit(shard_map(
+                _train_step_core, mesh=mesh,
+                in_specs=(state_specs, P('data', None)),
+                out_specs=(state_specs, P(), P()),
+                check_vma=False,
+            ), donate_argnums=(0,))
+
+            def train_step(model, optimizer, batch):
+                _, state = nnx.split((model, optimizer))
+                new_state, loss, metrics = train_step_core(state, batch)
+                nnx.update((model, optimizer), new_state)
+                return loss, metrics
 
         if steps_per_window > 1:
-            @nnx.jit
-            def train_window(model, optimizer, data):
-                graphdef, state = nnx.split((model, optimizer))
+            def _train_window_core(state, data):
                 def step_fn(carry_state, batch):
                     m, opt = nnx.merge(graphdef, carry_state)
-                    def loss_fn(mdl):
-                        return forward_and_loss(mdl, batch, model_config, train_config, deterministic=False)
-                    (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(m)
-                    grads = jax.lax.pmean(grads, axis_name='data')
-                    loss = jax.lax.pmean(loss, axis_name='data')
-                    metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name='data'), metrics)
+                    (loss, metrics), grads = nnx.value_and_grad(
+                        lambda mdl: forward_and_loss(mdl, batch, model_config, train_config, deterministic=False),
+                        has_aux=True,
+                    )(m)
+                    grads = jax.tree_util.tree_map(pmean_fn, grads)
+                    loss = pmean_fn(loss)
+                    metrics = jax.tree_util.tree_map(pmean_fn, metrics)
                     opt.update(m, grads)
                     _, new_state = nnx.split((m, opt))
                     return new_state, (loss, metrics)
                 final_state, (losses, metrics) = jax.lax.scan(step_fn, state, data)
-                nnx.update((model, optimizer), final_state)
-                return jnp.mean(losses), metrics
+                return final_state, jnp.mean(losses), metrics
+
+            train_window_core = jax.jit(shard_map(
+                _train_window_core, mesh=mesh,
+                in_specs=(state_specs, P(None, 'data', None)),
+                out_specs=(state_specs, P(), P()),
+                check_vma=False,
+            ), donate_argnums=(0,))
+
+            def train_window(model, optimizer, data):
+                _, state = nnx.split((model, optimizer))
+                new_state, loss, metrics = train_window_core(state, data)
+                nnx.update((model, optimizer), new_state)
+                return loss, metrics
 
         print(f"\n  Compiling...")
         warmup_data = loader.get_window(steps_per_window if steps_per_window > 1 else 1)
