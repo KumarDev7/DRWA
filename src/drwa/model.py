@@ -128,50 +128,50 @@ class DRWAModel(nnx.Module):
         return logits, metrics
 
 
+@nnx.jit
+def _gen_forward_jit(model: "DRWAModel", ctx: jnp.ndarray) -> jnp.ndarray:
+    """JIT-compiled single forward pass for generation.
+
+    Defined at module level so the compiled XLA kernel is cached and reused
+    across every token step and every call to generate().  The function must
+    always receive ctx with the same shape ([1, seq_len]) — see generate().
+
+    Under GSPMD (outside shard_map) psum calls are skipped via try/except;
+    JAX's transparent sharding handles the necessary collectives automatically.
+    """
+    logits, _ = model(ctx, deterministic=True)
+    return logits[:, -1, :].astype(jnp.float32)  # [1, vocab] — last token only
+
+
 def generate(
-    model: DRWAModel,
+    model: "DRWAModel",
     prompt_ids: jnp.ndarray,
     max_new_tokens: int,
     temperature: float = 1.0,
     top_p: float = 1.0,
     rng: jnp.ndarray = None,
 ) -> jnp.ndarray:
-    """Autoregressive generation with optional top-p (nucleus) sampling.
-
-    Parameters
-    ----------
-    model : DRWAModel
-    prompt_ids : jnp.ndarray  shape [T_prompt]  (1-D, single sequence)
-    max_new_tokens : int
-    temperature : float  1.0 = no scaling; lower = sharper
-    top_p : float  1.0 = no nucleus filtering
-    rng : jax PRNGKey  None → greedy decoding
-
-    Returns
-    -------
-    jnp.ndarray  shape [T_prompt + max_new_tokens]
-    """
+    """Autoregressive generation with optional top-p (nucleus) sampling."""
     seq_len = model.config.seq_len
     ids = prompt_ids  # 1-D
 
     for _ in range(max_new_tokens):
-        # Truncate context to seq_len
-        ctx = ids[-seq_len:][None, :]  # [1, T]
-        logits, _ = model(ctx, deterministic=True)
-        next_logits = logits[0, -1, :].astype(jnp.float32)  # [vocab]
+        # Always pad-left to exactly seq_len so _gen_forward_jit's compiled
+        # XLA kernel is reused every iteration (shape never changes).
+        ctx = ids[-seq_len:]
+        if ctx.shape[0] < seq_len:
+            ctx = jnp.concatenate([jnp.zeros(seq_len - ctx.shape[0], dtype=jnp.int32), ctx])
+        next_logits = _gen_forward_jit(model, ctx[None, :])[0]  # [vocab]
 
         if rng is None:
-            # Greedy
             next_token = jnp.argmax(next_logits)
         else:
             next_logits = next_logits / max(temperature, 1e-6)
             if top_p < 1.0:
-                # Sort descending and compute cumulative probs
                 sorted_idx = jnp.argsort(-next_logits)
                 sorted_logits = next_logits[sorted_idx]
                 probs = jax.nn.softmax(sorted_logits)
                 cum_probs = jnp.cumsum(probs)
-                # Mask tokens beyond the top-p nucleus
                 mask = cum_probs - probs > top_p
                 sorted_logits = jnp.where(mask, -1e9, sorted_logits)
                 next_logits = next_logits.at[sorted_idx].set(sorted_logits)
@@ -183,11 +183,18 @@ def generate(
     return ids
 
 
+_gen_compiled = False  # module-level flag to print compilation warning once
+
+
 def _generate_step(model, config, tokenizer, prompt, max_new_tokens, temperature, top_p, rng, step):
     """Run generation and print samples; called from the training loop."""
     import numpy as np
+    global _gen_compiled
 
     print(f"\n  --- generation @ step {step} ---")
+    if not _gen_compiled:
+        print(f"  (compiling generation kernel for seq_len={config.seq_len}...)")
+        _gen_compiled = True
     for i, p in enumerate(prompt):
         enc = tokenizer.encode(p)
         prompt_ids = jnp.array(enc, dtype=jnp.int32)
