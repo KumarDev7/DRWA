@@ -332,7 +332,7 @@ def shard_model(
             sharded_flat[key] = variable
             continue
 
-        for axis_idx, axis_name in enumerate(spec.axis_names):
+        for axis_idx, axis_name in enumerate(spec):
             if axis_name is not None and axis_name == "model":
                 dim_size = arr.shape[axis_idx]
                 if dim_size % n_model != 0:
