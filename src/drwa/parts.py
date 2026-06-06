@@ -116,29 +116,63 @@ class TransformerBlock(nnx.Module):
         return x
 
 
+def _scan_layers(layers, x, mask, deterministic, remat):
+    """Run a homogeneous nnx.List of TransformerBlocks via jax.lax.scan.
+
+    Stacks each layer's parameters along a leading axis at trace time, then
+    scans over them.  This collapses N unrolled layer ops in the XLA graph
+    down to a single scan body, which lets XLA pipeline compute with the
+    all-reduce collectives and dramatically shrinks compilation time for deep
+    models.
+
+    Remat (gradient checkpointing) is applied to the scan body rather than
+    per-block, so the granularity and memory savings are identical.
+    """
+    # graphdef captures the static module structure (same for every layer)
+    graphdef, _ = nnx.split(layers[0])
+
+    # Stack each layer's live parameters into [n_layers, *param_shape] arrays
+    layer_states = [nnx.split(l)[1] for l in layers]
+    stacked_state = jax.tree_util.tree_map(
+        lambda *leaves: jnp.stack(leaves, axis=0), *layer_states
+    )
+
+    def layer_step(carry, state_i):
+        layer = nnx.merge(graphdef, state_i)
+        return layer(carry, mask, deterministic), None
+
+    if remat:
+        layer_step = jax.checkpoint(layer_step)
+
+    x, _ = jax.lax.scan(layer_step, x, stacked_state)
+    return x
+
+
 class PartA(nnx.Module):
     def __init__(self, d_model, n_layers, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope=True, dtype=jnp.float32, remat=False, rngs=None, model_axis=None):
+        self._remat = remat
+        # remat is handled at the scan-body level; individual blocks run plain
         self.layers = nnx.List([
-            TransformerBlock(d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope, dtype, remat, rngs, model_axis=model_axis)
+            TransformerBlock(d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope, dtype, remat=False, rngs=rngs, model_axis=model_axis)
             for _ in range(n_layers)
         ])
         self.norm = nnx.LayerNorm(d_model, dtype=dtype, rngs=rngs)
 
     def __call__(self, x, mask=None, deterministic=True):
-        for layer in self.layers:
-            x = layer(x, mask, deterministic)
+        x = _scan_layers(self.layers, x, mask, deterministic, self._remat)
         return self.norm(x)
 
 
 class PartB(nnx.Module):
     def __init__(self, d_model, n_layers, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope=True, dtype=jnp.float32, remat=False, rngs=None, model_axis=None):
+        self._remat = remat
+        # remat is handled at the scan-body level; individual blocks run plain
         self.layers = nnx.List([
-            TransformerBlock(d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope, dtype, remat, rngs, model_axis=model_axis)
+            TransformerBlock(d_model, n_heads, n_kv_heads, d_ffn, max_seq_len, use_rope, dtype, remat=False, rngs=rngs, model_axis=model_axis)
             for _ in range(n_layers)
         ])
         self.norm = nnx.LayerNorm(d_model, dtype=dtype, rngs=rngs)
 
     def __call__(self, x, mask=None, deterministic=True):
-        for layer in self.layers:
-            x = layer(x, mask, deterministic)
+        x = _scan_layers(self.layers, x, mask, deterministic, self._remat)
         return self.norm(x)
