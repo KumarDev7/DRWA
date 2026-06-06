@@ -300,10 +300,14 @@ def train(config: RunConfig, resume_from: str = None):
                     "step_time_sec": win_time / steps_per_window,
                 }, step=step)
 
-                if step > 0 and step % config.checkpoint.every == 0:
+                # In windowed mode step jumps by steps_per_window, so use an
+                # interval-crossing check instead of step % N == 0 (which only
+                # fires when step is a multiple of lcm(steps_per_window, N)).
+                window_end = step + steps_per_window - 1
+                if step > 0 and window_end // config.checkpoint.every > (step - 1) // config.checkpoint.every:
                     ckpt_manager.save(model, optimizer, step, metrics={"loss": loss_val})
 
-                if gen_config.every > 0 and step % gen_config.every == 0:
+                if gen_config.every > 0 and window_end // gen_config.every > (step - 1) // gen_config.every:
                     _generate_step(
                         model, model_config, gen_tokenizer,
                         gen_config.prompts, gen_config.max_new_tokens,
