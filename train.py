@@ -191,11 +191,11 @@ def train(config: RunConfig, resume_from: str = None):
 
     if steps_per_window > 1:
         n_windows = (total_steps - start_step) // steps_per_window
+        data_np = loader.get_window(steps_per_window)
+        data = jax.device_put(data_np, window_sharding)
+
         for window_idx in range(n_windows):
             step = start_step + window_idx * steps_per_window
-
-            data_np = loader.get_window(steps_per_window)
-            data = jax.device_put(data_np, window_sharding)
 
             win_t0 = time.time()
             loss, window_metrics = train_window(model, optimizer, data)
@@ -235,11 +235,15 @@ def train(config: RunConfig, resume_from: str = None):
             if step > 0 and step % config.checkpoint.every == 0:
                 ckpt_manager.save(model, optimizer, step, metrics={"loss": loss_val})
 
+            if window_idx < n_windows - 1:
+                data_np = loader.get_window(steps_per_window)
+                data = jax.device_put(data_np, window_sharding)
+
         final_step = start_step + n_windows * steps_per_window
     else:
+        batch_np = loader.get_window(1)
         for step in range(start_step, total_steps):
-            batch_np = loader.get_window(1)[0]
-            batch = jax.device_put(batch_np, data_sharding)
+            batch = jax.device_put(batch_np[0], data_sharding)
 
             step_t0 = time.time()
             loss, metrics = train_step(model, optimizer, batch)
@@ -276,6 +280,9 @@ def train(config: RunConfig, resume_from: str = None):
 
             if step > 0 and step % config.checkpoint.every == 0:
                 ckpt_manager.save(model, optimizer, step, metrics={"loss": loss_val})
+
+            if step < total_steps - 1:
+                batch_np = loader.get_window(1)
 
         final_step = total_steps
 

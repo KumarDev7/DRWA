@@ -5,6 +5,7 @@ Data loaders for DRWA training.
 import jax
 import jax.numpy as jnp
 import numpy as np
+from threading import Thread
 from typing import Optional, Iterator, Tuple
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -195,28 +196,68 @@ class TinyStoriesDataLoader(HuggingFaceDataLoader):
         )
 
 
+class PrefetchDataLoader:
+    """Wraps a DataLoader to prefetch next window in a background thread."""
+
+    def __init__(self, loader: DataLoader):
+        self.loader = loader
+        self._prefetch_thread = None
+        self._prefetch_result = None
+        self._prefetch_error = None
+
+    def get_window(self, steps: int) -> np.ndarray:
+        if self._prefetch_thread is not None:
+            self._prefetch_thread.join()
+            if self._prefetch_error is not None:
+                raise self._prefetch_error
+            result = self._prefetch_result
+        else:
+            result = self.loader.get_window(steps)
+
+        self._prefetch_error = None
+        self._prefetch_result = None
+
+        def _prefetch():
+            try:
+                self._prefetch_result = self.loader.get_window(steps)
+            except Exception as e:
+                self._prefetch_error = e
+        self._prefetch_thread = Thread(target=_prefetch, daemon=True)
+        self._prefetch_thread.start()
+
+        return result
+
+    def reset(self):
+        if self._prefetch_thread is not None:
+            self._prefetch_thread.join()
+            self._prefetch_thread = None
+        self.loader.reset()
+
+
 def create_data_loader(
     config,
     train_config,
     process_index: int = 0,
     process_count: int = 1,
+    prefetch: bool = True,
 ) -> DataLoader:
     """Create data loader based on config.
-    
+
     Args:
         config: DRWAConfig
         train_config: TrainConfig
         process_index: Process index for multi-host (unused for random)
         process_count: Total processes for multi-host (unused for random)
-    
+        prefetch: Wrap loader in background thread prefetch
+
     Returns:
-        DataLoader instance
+        DataLoader instance (wrapped in PrefetchDataLoader if prefetch=True)
     """
     data_cfg = config.get("data", {})
     source = data_cfg.get("source", "random")
     
     if source == "random":
-        return SyntheticDataLoader(
+        loader = SyntheticDataLoader(
             seq_len=config["model"]["seq_len"],
             batch_size=train_config.batch_size // process_count,
             vocab_size=config["model"]["vocab_size"],
@@ -225,7 +266,7 @@ def create_data_loader(
         )
     
     elif source == "tiny_stories":
-        return TinyStoriesDataLoader(
+        loader = TinyStoriesDataLoader(
             seq_len=config["model"]["seq_len"],
             batch_size=train_config.batch_size // process_count,
             vocab_size=config["model"]["vocab_size"],
@@ -234,7 +275,7 @@ def create_data_loader(
         )
     
     elif source == "hf":
-        return HuggingFaceDataLoader(
+        loader = HuggingFaceDataLoader(
             seq_len=config["model"]["seq_len"],
             batch_size=train_config.batch_size // process_count,
             vocab_size=config["model"]["vocab_size"],
@@ -247,3 +288,5 @@ def create_data_loader(
     
     else:
         raise ValueError(f"Unknown data source: {source}")
+    
+    return PrefetchDataLoader(loader) if prefetch else loader
