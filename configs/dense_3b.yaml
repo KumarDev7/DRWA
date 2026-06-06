@@ -52,3 +52,13 @@ checkpoint:
 wandb:
   project: drwa
   name: dense_3b
+
+generate:
+  every: 1000          # sample every N steps (0 = disabled)
+  max_new_tokens: 128
+  temperature: 0.8
+  top_p: 0.9
+  seed: 42
+  prompts:
+    - "Once upon a time"
+    - "The quick brown fox"

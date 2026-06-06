@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from drwa.config import DRWAConfig, TrainConfig
 from drwa.run_config import RunConfig, load_config
-from drwa.model import DRWAModel, forward_and_loss, compute_step_flops, count_params
+from drwa.model import DRWAModel, forward_and_loss, compute_step_flops, count_params, _generate_step
 from drwa.sharding import create_mesh, shard_model, get_data_shardings
 from drwa.data import create_data_loader
 from drwa.checkpoint import CheckpointManager, MetricsLogger
@@ -146,6 +146,15 @@ def train(config: RunConfig, resume_from: str = None):
 
     total_steps = train_config.total_steps
     log_every = train_config.log_every
+    gen_config = config.generate
+
+    # Build tokenizer once for generation (only if generation is enabled)
+    gen_tokenizer = None
+    gen_rng = None
+    if gen_config.every > 0:
+        from transformers import AutoTokenizer
+        gen_tokenizer = AutoTokenizer.from_pretrained(config.data.hf_tokenizer)
+        gen_rng = jax.random.PRNGKey(gen_config.seed)
 
     with jax.set_mesh(mesh):
 
@@ -294,6 +303,14 @@ def train(config: RunConfig, resume_from: str = None):
                 if step > 0 and step % config.checkpoint.every == 0:
                     ckpt_manager.save(model, optimizer, step, metrics={"loss": loss_val})
 
+                if gen_config.every > 0 and step % gen_config.every == 0:
+                    _generate_step(
+                        model, model_config, gen_tokenizer,
+                        gen_config.prompts, gen_config.max_new_tokens,
+                        gen_config.temperature, gen_config.top_p,
+                        gen_rng, step,
+                    )
+
                 if window_idx < n_windows - 1:
                     data_np = loader.get_window(steps_per_window)
                     data = jax.device_put(data_np, window_sharding)
@@ -339,6 +356,14 @@ def train(config: RunConfig, resume_from: str = None):
 
                 if step > 0 and step % config.checkpoint.every == 0:
                     ckpt_manager.save(model, optimizer, step, metrics={"loss": loss_val})
+
+                if gen_config.every > 0 and step % gen_config.every == 0:
+                    _generate_step(
+                        model, model_config, gen_tokenizer,
+                        gen_config.prompts, gen_config.max_new_tokens,
+                        gen_config.temperature, gen_config.top_p,
+                        gen_rng, step,
+                    )
 
                 if step < total_steps - 1:
                     batch_np = loader.get_window(1)

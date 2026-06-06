@@ -51,7 +51,18 @@ class WandbConfig:
     log_every: int = 10
 
 
-@dataclass  
+@dataclass
+class GenerateConfig:
+    """Periodic generation / sampling configuration."""
+    every: int = 0              # Generate every N steps; 0 = disabled
+    max_new_tokens: int = 128
+    temperature: float = 0.8
+    top_p: float = 0.9
+    prompts: List[str] = field(default_factory=lambda: ["Once upon a time"])
+    seed: int = 42
+
+
+@dataclass
 class RunConfig:
     """Complete run configuration."""
     model: DRWAConfig
@@ -60,6 +71,7 @@ class RunConfig:
     data: DataConfig = field(default_factory=DataConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    generate: GenerateConfig = field(default_factory=GenerateConfig)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for logging."""
@@ -92,7 +104,8 @@ class RunConfig:
         data_cfg = DataConfig(**data.get('data', {}))
         checkpoint = CheckpointConfig(**data.get('checkpoint', {}))
         wandb = WandbConfig(**data.get('wandb', {}))
-        
+        generate = GenerateConfig(**data.get('generate', {}))
+
         return cls(
             model=model,
             train=train,
@@ -100,6 +113,7 @@ class RunConfig:
             data=data_cfg,
             checkpoint=checkpoint,
             wandb=wandb,
+            generate=generate,
         )
     
     @classmethod

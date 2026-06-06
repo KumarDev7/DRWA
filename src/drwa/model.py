@@ -128,6 +128,79 @@ class DRWAModel(nnx.Module):
         return logits, metrics
 
 
+def generate(
+    model: DRWAModel,
+    prompt_ids: jnp.ndarray,
+    max_new_tokens: int,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    rng: jnp.ndarray = None,
+) -> jnp.ndarray:
+    """Autoregressive generation with optional top-p (nucleus) sampling.
+
+    Parameters
+    ----------
+    model : DRWAModel
+    prompt_ids : jnp.ndarray  shape [T_prompt]  (1-D, single sequence)
+    max_new_tokens : int
+    temperature : float  1.0 = no scaling; lower = sharper
+    top_p : float  1.0 = no nucleus filtering
+    rng : jax PRNGKey  None → greedy decoding
+
+    Returns
+    -------
+    jnp.ndarray  shape [T_prompt + max_new_tokens]
+    """
+    seq_len = model.config.seq_len
+    ids = prompt_ids  # 1-D
+
+    for _ in range(max_new_tokens):
+        # Truncate context to seq_len
+        ctx = ids[-seq_len:][None, :]  # [1, T]
+        logits, _ = model(ctx, deterministic=True)
+        next_logits = logits[0, -1, :].astype(jnp.float32)  # [vocab]
+
+        if rng is None:
+            # Greedy
+            next_token = jnp.argmax(next_logits)
+        else:
+            next_logits = next_logits / max(temperature, 1e-6)
+            if top_p < 1.0:
+                # Sort descending and compute cumulative probs
+                sorted_idx = jnp.argsort(-next_logits)
+                sorted_logits = next_logits[sorted_idx]
+                probs = jax.nn.softmax(sorted_logits)
+                cum_probs = jnp.cumsum(probs)
+                # Mask tokens beyond the top-p nucleus
+                mask = cum_probs - probs > top_p
+                sorted_logits = jnp.where(mask, -1e9, sorted_logits)
+                next_logits = next_logits.at[sorted_idx].set(sorted_logits)
+            rng, sample_rng = jax.random.split(rng)
+            next_token = jax.random.categorical(sample_rng, next_logits)
+
+        ids = jnp.concatenate([ids, next_token[None]])
+
+    return ids
+
+
+def _generate_step(model, config, tokenizer, prompt, max_new_tokens, temperature, top_p, rng, step):
+    """Run generation and print samples; called from the training loop."""
+    import numpy as np
+
+    print(f"\n  --- generation @ step {step} ---")
+    for i, p in enumerate(prompt):
+        enc = tokenizer.encode(p)
+        prompt_ids = jnp.array(enc, dtype=jnp.int32)
+        key = jax.random.fold_in(rng, i) if rng is not None else None
+        out_ids = generate(model, prompt_ids, max_new_tokens, temperature, top_p, key)
+        out_ids_np = np.array(out_ids).tolist()
+        text = tokenizer.decode(out_ids_np)
+        label = f"  [{i}] prompt: {p!r}"
+        print(label)
+        print(f"       output: {text!r}")
+    print(f"  --- end generation ---\n")
+
+
 def forward_and_loss(
     model: DRWAModel,
     input_ids: jnp.ndarray,

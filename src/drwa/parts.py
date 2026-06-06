@@ -21,6 +21,20 @@ def apply_rope(x, cos, sin):
     return x * cos + x_rotated * sin
 
 
+def _psum_if_parallel(x, axis_name):
+    """All-reduce x along axis_name when inside shard_map; no-op otherwise.
+
+    Under shard_map each device holds a partial result and the psum combines
+    them.  During eager generation (outside any shard_map context) JAX's
+    transparent sharding already exposes the full logical tensor, so the
+    operation is correctly skipped.
+    """
+    try:
+        return jax.lax.psum(x, axis_name)
+    except NameError:
+        return x
+
+
 class CausalSelfAttention(nnx.Module):
     def __init__(self, d_model, n_heads, n_kv_heads, max_seq_len, use_rope=True, dtype=jnp.float32, rngs=None, model_axis=None):
         self.d_model = d_model
@@ -43,30 +57,26 @@ class CausalSelfAttention(nnx.Module):
 
     def __call__(self, x, mask=None, deterministic=True):
         B, T, d = x.shape
-        # Under shard_map the q/k/v projections are column-parallel: each device
-        # holds only n_heads/n_model (and n_kv_heads/n_model) heads locally, so
-        # the reshapes must use the per-device head counts.
-        n_heads = self.n_heads
-        n_kv_heads = self.n_kv_heads
-        if self.model_axis is not None:
-            n_model = jax.lax.axis_size(self.model_axis)
-            n_heads = n_heads // n_model
-            n_kv_heads = n_kv_heads // n_model
-        q = self.wq(x).reshape(B, T, n_heads, self.head_dim)
-        k = self.wk(x).reshape(B, T, n_kv_heads, self.head_dim)
-        v = self.wv(x).reshape(B, T, n_kv_heads, self.head_dim)
+        # Infer per-device head counts from the actual projection output size.
+        # Inside shard_map the column-parallel kernel is sliced, giving
+        # n_heads/n_model heads per device.  Outside shard_map (generation)
+        # JAX exposes the full logical weight, giving all n_heads.
+        q_proj = self.wq(x)
+        k_proj = self.wk(x)
+        v_proj = self.wv(x)
+        n_h  = q_proj.shape[-1] // self.head_dim
+        n_kv = k_proj.shape[-1] // self.head_dim
+        q = q_proj.reshape(B, T, n_h,  self.head_dim)
+        k = k_proj.reshape(B, T, n_kv, self.head_dim)
+        v = v_proj.reshape(B, T, n_kv, self.head_dim)
         if self.use_rope:
             q = apply_rope(q, self.cos.value, self.sin.value)
             k = apply_rope(k, self.cos.value, self.sin.value)
-        out = jax.nn.dot_product_attention(
-            q, k, v,
-            is_causal=True,
-            mask=mask,
-        )
-        out = out.reshape(B, T, n_heads * self.head_dim)
+        out = jax.nn.dot_product_attention(q, k, v, is_causal=True, mask=mask)
+        out = out.reshape(B, T, n_h * self.head_dim)
         out = self.wo(out)
         if self.model_axis is not None:
-            out = jax.lax.psum(out, self.model_axis)
+            out = _psum_if_parallel(out, self.model_axis)
         return out
 
 
@@ -80,7 +90,7 @@ class FFN(nnx.Module):
     def __call__(self, x):
         h = self.w2(jax.nn.gelu(self.w1(x)))
         if self.model_axis is not None:
-            h = jax.lax.psum(h, self.model_axis)
+            h = _psum_if_parallel(h, self.model_axis)
         return h
 
 
