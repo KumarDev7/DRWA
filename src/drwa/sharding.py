@@ -380,12 +380,14 @@ def get_data_shardings(
     2D mesh (data=2, model=4):
     >>> mesh, _ = create_mesh(ShardingConfig(n_data=2, n_model=4))
     >>> ds, ws = get_data_shardings(mesh)
-    >>> # ds  → NamedSharding(mesh, P('data', None, None))
-    >>> # ws  → NamedSharding(mesh, P(None, 'data', None, None))
+    >>> # ds  → NamedSharding(mesh, P('data', None))        — rank 2: [B, T]
+    >>> # ws  → NamedSharding(mesh, P(None, 'data', None))  — rank 3: [steps, B, T]
     """
     if "model" in mesh.axis_names:
+        # 2D mesh: data only uses 'data' axis, 'model' is None (replicated)
+        # Single-step data is [B, T] (rank 2), windowed is [steps, B, T] (rank 3)
         return (
-            NamedSharding(mesh, P("data", None, None)),
+            NamedSharding(mesh, P("data", None)),
             NamedSharding(mesh, P(None, "data", None)),
         )
     return (
